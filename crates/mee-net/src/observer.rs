@@ -141,6 +141,14 @@ impl Rpc {
         Rpc { http, url: url.to_string() }
     }
 
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
     /// `(owner, data)` of a finalized account, or `None` if it doesn't exist.
     pub async fn account(&self, key: &Pubkey) -> Result<Option<(Pubkey, Vec<u8>)>, String> {
         let body = json!({

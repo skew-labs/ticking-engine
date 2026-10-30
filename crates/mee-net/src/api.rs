@@ -5,6 +5,7 @@
 //! - `GET /book/{market}?depth=N`
 //! - `GET /account/{pubkey}` (base58 or hex): balances, positions and a Merkle proof
 //!   against the latest state root
+//! - `GET /withdrawals?from=ID&limit=N`: receipts from `from` on (max 500)
 //! - `GET /withdrawals/{id}`: the receipt and this validator's signature
 //!   over the bridge message (a relayer collects a quorum of these)
 //! - `GET /triggers/{pubkey}`: the account's pending TP/SL orders
@@ -90,6 +91,7 @@ pub async fn serve(shared: Arc<Shared>, listener: TcpListener) {
         .route("/status", get(status))
         .route("/book/{market}", get(book))
         .route("/account/{key}", get(account))
+        .route("/withdrawals", get(withdrawals))
         .route("/withdrawals/{id}", get(withdrawal))
         .route("/triggers/{key}", get(triggers))
         .route("/state_root/{height}", get(state_root))
@@ -295,6 +297,26 @@ async fn triggers(State(s): S, Path(key): Path<String>) -> Response {
         })
         .collect();
     Json(json!({ "triggers": list })).into_response()
+}
+
+#[derive(Deserialize)]
+struct RangeQuery {
+    from: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn withdrawals(State(s): S, Query(q): Query<RangeQuery>) -> Json<Value> {
+    let n = s.node.lock().unwrap();
+    let from = q.from.unwrap_or(0) as usize;
+    let list: Vec<Value> = n
+        .chain
+        .withdrawals
+        .iter()
+        .skip(from)
+        .take(q.limit.unwrap_or(100).min(500))
+        .map(|w| json!({ "id": w.id, "asset": w.asset, "destination": k58(&w.destination), "amount": w.amount.to_string() }))
+        .collect();
+    Json(json!({ "withdrawals": list, "next": n.chain.withdrawals.len() }))
 }
 
 async fn withdrawal(State(s): S, Path(id): Path<u64>) -> Response {

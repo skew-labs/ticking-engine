@@ -20,6 +20,7 @@
 pub mod api;
 pub mod config;
 pub mod observer;
+pub mod relayer;
 pub mod wire;
 
 use std::collections::HashMap;
