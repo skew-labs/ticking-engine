@@ -99,6 +99,11 @@ impl Replica {
         self.mempool.push_back(payload);
     }
 
+    /// Payloads waiting to be proposed.
+    pub fn queued_payloads(&self) -> usize {
+        self.mempool.len()
+    }
+
     /// Finalized blocks since the last call, in chain order.
     pub fn drain_commits(&mut self) -> Vec<Block> {
         std::mem::take(&mut self.commits)
