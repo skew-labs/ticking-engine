@@ -1,0 +1,30 @@
+[package]
+name = "mee"
+description = "MEE: HIP-3 style builder-deployed perp DEXes on Solana"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+
+[dependencies]
+mee-core = { path = "../../crates/mee-core" }
+bytemuck.workspace = true
+borsh.workspace = true
+solana-program = "=4.0.0"
+solana-pubkey = { version = "4.2", features = ["curve25519"] }
+
+[dev-dependencies]
+solana-program-test = { version = "=4.2.2", features = ["agave-unstable-api"] }
+solana-keypair = "3"
+solana-signer = "3"
+solana-transaction = "4.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))', 'cfg(feature, values("custom-heap", "custom-panic"))'] }
