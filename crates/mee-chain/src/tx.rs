@@ -262,6 +262,28 @@ impl SignedTx {
     }
 }
 
+/// Checks many user signatures at once: one batch verification (about twice
+/// as fast as one by one), falling back to single checks only when the batch
+/// fails, to find which ones are bad.
+pub fn verify_batch(chain_id: u64, txs: &[&SignedTx]) -> Vec<bool> {
+    let mut msgs = Vec::with_capacity(txs.len());
+    let mut sigs = Vec::with_capacity(txs.len());
+    let mut keys = Vec::with_capacity(txs.len());
+    for t in txs {
+        let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&t.signer) else {
+            return txs.iter().map(|t| t.verify(chain_id)).collect();
+        };
+        msgs.push(SignedTx::message(chain_id, &t.signer, t.nonce, &t.action));
+        sigs.push(ed25519_dalek::Signature::from_bytes(&t.signature));
+        keys.push(vk);
+    }
+    let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
+    if keys.len() > 1 && ed25519_dalek::verify_batch(&refs, &sigs, &keys).is_ok() {
+        return vec![true; txs.len()];
+    }
+    txs.iter().map(|t| t.verify(chain_id)).collect()
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Attestation {
     pub validator: u16,

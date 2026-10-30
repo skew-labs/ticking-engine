@@ -8,11 +8,11 @@
 
 | 구성 | 경로 | 설명 |
 |---|---|---|
-| CEX급 엔진 | [`crates/mee-engine`](crates/mee-engine) | 오더북, 증거금/청산/펀딩 TWAP/ADL, 여러 DEX, 머클 상태 커밋먼트. 단일 스레드 약 173만 ops/s |
-| 체인 상태 머신 | [`crates/mee-chain`](crates/mee-chain) | 서명 트랜잭션, 취소 우선 블록 순서, 정정·배치·TP/SL, 브릿지, 런치 상장/오라클, 가중치 스테이킹·슬래싱, 계정 증명. 4코어 약 12만 tx/s |
+| CEX급 엔진 | [`crates/mee-engine`](crates/mee-engine) | 오더북, 증거금/청산/펀딩 TWAP/ADL, 여러 DEX, 머클 상태 커밋먼트(지연·병렬 북 다이제스트). 단일 스레드 약 160만 ops/s(커밋 포함) |
+| 체인 상태 머신 | [`crates/mee-chain`](crates/mee-chain) | 서명 트랜잭션, 취소 우선 블록 순서, 정정·배치·TP/SL, 브릿지, 런치 상장/오라클, 가중치 스테이킹·슬래싱, 계정 증명. 파이프라인 실행 약 109만 tx/s (서명은 입장 때 병렬 검증) |
 | BFT 합의 | [`crates/mee-consensus`](crates/mee-consensus) | HotStuff 2-chain (Jolteon식), 리더 평판, 커밋 증명, 장애 시뮬레이터 |
 | 검증인 노드 | [`crates/mee-node`](crates/mee-node) | 합의 → 체인, 디스크 영속성/크래시 복구, 검증된 스냅샷, 에폭 전환, 이중 투표 증거, 검증된 상태 동기화 |
-| 네트워크 + 운영 | [`crates/mee-net`](crates/mee-net) | 암호화·인증 P2P, 가십, 동기화, HTTP/JSON + WebSocket, 솔라나 입금 자동 증명, 출금 릴레이어, `mee-validator`/`mee-relayer` |
+| 네트워크 + 운영 | [`crates/mee-net`](crates/mee-net) | 검증인 파이프라인(코어 고정 서명 검증 단계), 암호화·인증 P2P, 가십, 동기화, HTTP/JSON + WebSocket, 솔라나 입금 자동 증명, 출금 릴레이어, `mee-validator`/`mee-relayer` |
 | 솔라나 프로그램 | [`programs/mee`](programs/mee) | 브릿지(입금, 출금 승인 + 이의제기 기간 + 잠금, 검증인 교체), 런치패드(본딩커브, 졸업, TWAP AMM), 온체인 HIP-3 DEX |
 | 공용/온체인 엔진 | [`crates/mee-core`](crates/mee-core) | 공용 수학, 파라미터, 고정 크기 온체인 엔진 |
 | 설계 문서 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 구조, 측정값, 프로토콜 규칙, 회계 공식, 한계 |

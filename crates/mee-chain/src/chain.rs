@@ -1,10 +1,12 @@
 //! The replicated state machine: every validator applies the same ordered
 //! blocks and must reach the same app hash.
 
+use borsh::BorshSerialize;
 use mee_core::{EngineError, EngineParams, OrderKind, Side};
 use mee_engine::engine::Result as EngineResult;
 use mee_engine::{AccountId, CancelReason, DexId, Event, MarketId, OrderRequest, State};
 use rustc_hash::FxHashMap;
+use sha2::Digest;
 
 use crate::crypto::{self, Hash, Pubkey};
 use crate::tx::*;
@@ -173,7 +175,7 @@ pub fn lot_for(twap_scaled: u128, min_lot_value: u64) -> Option<(u64, u64)> {
     None
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, BorshSerialize)]
 pub enum TxError {
     BadSignature,
     StaleNonce,
@@ -197,7 +199,11 @@ pub enum TxError {
     },
     TooManyTriggers,
     UnknownTrigger,
-    Engine(EngineError),
+    Engine(#[borsh(serialize_with = "ser_engine_error")] EngineError),
+}
+
+fn ser_engine_error<W: std::io::Write>(e: &EngineError, w: &mut W) -> std::io::Result<()> {
+    w.write_all(&e.code().to_le_bytes())
 }
 
 impl From<EngineError> for TxError {
@@ -472,7 +478,9 @@ impl Chain {
         }
     }
 
-    fn check_nonce(&self, tx: &Tx) -> Result<(), TxError> {
+    /// Stateful admission check: the signer has an account and the nonce
+    /// is fresh.
+    pub fn check_nonce(&self, tx: &Tx) -> Result<(), TxError> {
         if let Tx::User(t) = tx {
             // Nonces live in the account (so they are committed); a key with
             // no account can't act, and its transactions consume nothing.
@@ -487,38 +495,59 @@ impl Chain {
     /// Verifies every transaction's signatures across all cores. Pure, so
     /// running it in parallel keeps execution deterministic.
     pub fn verify_parallel(&self, txs: &[Tx]) -> Vec<Result<(), TxError>> {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        if threads == 1 || txs.len() < 64 {
-            return txs.iter().map(|t| self.verify_tx(t)).collect();
-        }
-        let chunk = txs.len().div_ceil(threads);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = txs.chunks(chunk).map(|c| scope.spawn(move || self.verify_chunk(c))).collect();
-            handles.into_iter().flat_map(|h| h.join().expect("verifier thread")).collect()
-        })
+        self.verify_parallel_except(txs, &[])
     }
 
-    /// Batch-verifies the user signatures of a chunk (about twice as fast as
-    /// one by one); falls back to single checks to pinpoint a bad one.
-    fn verify_chunk(&self, txs: &[Tx]) -> Vec<Result<(), TxError>> {
-        let mut msgs = Vec::new();
-        let mut sigs = Vec::new();
-        let mut keys = Vec::new();
-        for tx in txs {
-            if let Tx::User(t) = tx {
-                let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&t.signer) else {
-                    return txs.iter().map(|t| self.verify_tx(t)).collect();
-                };
-                msgs.push(SignedTx::message(self.chain_id, &t.signer, t.nonce, &t.action));
-                sigs.push(ed25519_dalek::Signature::from_bytes(&t.signature));
-                keys.push(vk);
-            }
+    /// Like `verify_parallel`, but trusts the user signatures of transactions
+    /// marked in `known` (ones this node already verified, e.g. on mempool
+    /// admission). A user signature's validity depends only on the bytes and
+    /// the chain id, so skipping it can't change the outcome. System
+    /// transactions are always checked: their quorum depends on the current
+    /// validator set.
+    pub fn verify_parallel_except(&self, txs: &[Tx], known: &[bool]) -> Vec<Result<(), TxError>> {
+        let todo: Vec<usize> = (0..txs.len())
+            .filter(|&i| !(matches!(txs[i], Tx::User(_)) && known.get(i).copied().unwrap_or(false)))
+            .collect();
+        let mut out = vec![Ok(()); txs.len()];
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let results: Vec<Result<(), TxError>> = if threads == 1 || todo.len() < 64 {
+            self.verify_chunk(txs, &todo)
+        } else {
+            let chunk = todo.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> =
+                    todo.chunks(chunk).map(|c| scope.spawn(move || self.verify_chunk(txs, c))).collect();
+                handles.into_iter().flat_map(|h| h.join().expect("verifier thread")).collect()
+            })
+        };
+        for (i, r) in todo.into_iter().zip(results) {
+            out[i] = r;
         }
-        let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
-        if !keys.is_empty() && ed25519_dalek::verify_batch(&refs, &sigs, &keys).is_ok() {
-            return txs.iter().map(|t| if matches!(t, Tx::User(_)) { Ok(()) } else { self.verify_tx(t) }).collect();
-        }
-        txs.iter().map(|t| self.verify_tx(t)).collect()
+        out
+    }
+
+    /// Verifies `txs[i]` for each `i` in `idx`, batching the user signatures.
+    fn verify_chunk(&self, txs: &[Tx], idx: &[usize]) -> Vec<Result<(), TxError>> {
+        let users: Vec<&SignedTx> = idx
+            .iter()
+            .filter_map(|&i| match &txs[i] {
+                Tx::User(t) => Some(t),
+                Tx::System(_) => None,
+            })
+            .collect();
+        let mut ok = crate::tx::verify_batch(self.chain_id, &users).into_iter();
+        idx.iter()
+            .map(|&i| match &txs[i] {
+                Tx::User(_) => {
+                    if ok.next().expect("one result per user tx") {
+                        Ok(())
+                    } else {
+                        Err(TxError::BadSignature)
+                    }
+                }
+                tx => self.verify_tx(tx),
+            })
+            .collect()
     }
 
     fn check_quorum(&self, msg: &Hash, attestations: &[Attestation]) -> Result<(), TxError> {
@@ -540,6 +569,18 @@ impl Chain {
     /// Applies a committed block. Individual transactions may fail (their
     /// result says why) without failing the block.
     pub fn apply_block(&mut self, block: &Block) -> Result<BlockOutcome, BlockError> {
+        let verified = self.verify_parallel(&block.txs);
+        self.apply_verified_block(block, verified)
+    }
+
+    /// Applies a block whose signature checks were already done
+    /// (`verify_parallel[_except]`, one result per transaction).
+    pub fn apply_verified_block(
+        &mut self,
+        block: &Block,
+        verified: Vec<Result<(), TxError>>,
+    ) -> Result<BlockOutcome, BlockError> {
+        assert_eq!(verified.len(), block.txs.len(), "one verification result per transaction");
         if block.height != self.height + 1 {
             return Err(BlockError::WrongHeight);
         }
@@ -550,7 +591,6 @@ impl Chain {
         self.timestamp_ms = block.timestamp_ms;
 
         let mut out = BlockOutcome::default();
-        let verified = self.verify_parallel(&block.txs);
         let mut order: Vec<usize> = (0..block.txs.len()).collect();
         order.sort_by_key(|&i| block.txs[i].priority()); // stable: keeps proposer order within a class
 
@@ -598,20 +638,15 @@ impl Chain {
         let roots = self.state.commit();
         self.state_root = crypto::sha256(&[b"MEE/chain-state", &roots.root, &self.globals_hash()]);
         out.state_root = self.state_root;
-        let mut h = sha2_chain(&self.app_hash, block);
-        h = crypto::sha256(&[&h, &self.state_root]);
-        for r in &out.results {
-            h = crypto::sha256(&[&h, format!("{r:?}").as_bytes()]);
-        }
-        for e in &out.events {
-            h = crypto::sha256(&[&h, format!("{e:?}").as_bytes()]);
-        }
-        for w in &out.withdrawals {
-            h = crypto::sha256(&[&h, &borsh::to_vec(w).expect("borsh")]);
-        }
-        for t in &out.triggered {
-            h = crypto::sha256(&[&h, format!("{t:?}").as_bytes()]);
-        }
+        // One hash over the borsh encoding of everything the block produced,
+        // streamed (no per-item allocation or finalization).
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(sha2_chain(&self.app_hash, block));
+        hasher.update(self.state_root);
+        (&out.results, &out.events, &out.withdrawals, &out.triggered)
+            .serialize(&mut hasher)
+            .expect("hashing can't fail");
+        let h: Hash = hasher.finalize().into();
         self.app_hash = h;
         out.app_hash = h;
         if out.validator_set.is_some() {

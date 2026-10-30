@@ -93,6 +93,7 @@ async fn run(args: &[String]) -> std::io::Result<()> {
             .clone()
             .map(|rpc_url| SolanaConfig { rpc_url, poll: Duration::from_millis(c.solana_poll_ms) }),
         api_rate_per_sec: c.api_rate_per_sec,
+        sigverify: mee_net::sigverify::Options { threads: c.sigverify_threads, pin_cores: c.pin_cores },
     };
     let handle =
         mee_net::start(cfg, TcpListener::bind(c.p2p_listen).await?, TcpListener::bind(c.api_listen).await?).await?;
@@ -122,6 +123,7 @@ async fn devnet(args: &[String]) -> std::io::Result<()> {
         peers: (0..nodes).filter(|&j| j != index).map(|j| local(p2p_base + j as u16)).collect(),
         solana: None,
         api_rate_per_sec: 0,
+        sigverify: Default::default(),
     };
     let handle = mee_net::start(cfg, p2p, api).await?;
     eprintln!("node {index} ({}) p2p {} api http://{}", b58(&handle.shared.me()), handle.p2p_addr, handle.api_addr);

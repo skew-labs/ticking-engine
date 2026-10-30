@@ -166,6 +166,37 @@ fn signatures_and_nonces() {
 }
 
 #[test]
+fn batch_verification_and_pre_verified_skips() {
+    let mut net = Net::new();
+    let good: Vec<Tx> =
+        (0..200u8).map(|i| Tx::User(SignedTx::sign(&key(i), CHAIN, 1, Action::SweepProtocolFees { dex: 0 }))).collect();
+    let mut txs = good.clone();
+    // A bad signature in the middle of a batch is pinpointed.
+    if let Tx::User(t) = &mut txs[77] {
+        t.signature[5] ^= 1;
+    }
+    let mut bad_deposit = net.deposit_tx(&key(1), ASSET_QUOTE, 1);
+    if let Tx::System(SystemTx::BridgeDeposit { amount, .. }) = &mut bad_deposit {
+        *amount += 1; // attestations no longer match
+    }
+    txs.push(bad_deposit);
+    let v = net.chain.verify_parallel(&txs);
+    assert_eq!(v.iter().filter(|r| r.is_err()).count(), 2);
+    assert_eq!(v[77], Err(TxError::BadSignature));
+    assert_eq!(v[200], Err(TxError::NoQuorum));
+    // Marked known: user signatures are trusted (the node verified those
+    // exact bytes before), system transactions are still checked.
+    let v = net.chain.verify_parallel_except(&txs, &vec![true; txs.len()]);
+    assert_eq!(v[77], Ok(()));
+    assert_eq!(v[200], Err(TxError::NoQuorum));
+    // Only some known: the rest are verified as usual.
+    let known: Vec<bool> = (0..txs.len()).map(|i| i % 2 == 0).collect();
+    let v = net.chain.verify_parallel_except(&txs, &known);
+    assert_eq!(v[77], Err(TxError::BadSignature), "odd index, not known");
+    assert_eq!(v.iter().filter(|r| r.is_err()).count(), 2);
+}
+
+#[test]
 fn deposits_need_ordered_quorum_attestations() {
     let mut net = Net::new();
     let owner = crypto::pubkey(&key(1));

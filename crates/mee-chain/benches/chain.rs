@@ -63,16 +63,12 @@ fn main() {
         deposits.push(Tx::System(SystemTx::BridgeDeposit { deposit_id: i as u64, owner, asset, amount, attestations }));
     }
     let mut height = 0;
-    let mut apply = |chain: &mut Chain, txs: Vec<Tx>| {
-        height += 1;
-        chain.apply_block(&Block { height, timestamp_ms: height as i64 * 1_000, txs }).unwrap()
-    };
-    apply(&mut chain, deposits);
+    apply(&mut chain, &mut height, deposits, false);
     let setup = vec![tx(
         &dep,
         Action::DeployDex { name: [0; 16], fee_share_bps: 0, stake: 1, oracle_authority: crypto::pubkey(&dep) },
     )];
-    apply(&mut chain, setup);
+    apply(&mut chain, &mut height, setup, false);
     let mut setup = vec![tx(
         &dep,
         Action::AddMarket {
@@ -94,7 +90,7 @@ fn main() {
     for k in &traders {
         setup.push(tx(k, Action::TransferToDex { dex: 0, amount: 1_000_000_000_000 }));
     }
-    apply(&mut chain, setup);
+    apply(&mut chain, &mut height, setup, false);
 
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let mut rnd = |n: u64| {
@@ -103,7 +99,10 @@ fn main() {
         seed ^= seed << 17;
         seed % n
     };
-    let (blocks, per_block) = (10, 20_000);
+    // Half the blocks verify signatures at execution; the other half were
+    // verified on mempool admission (the validator pipeline), so execution
+    // only trusts them.
+    let (blocks, per_block) = (20, 20_000);
     let mut signed = Vec::new();
     for _ in 0..blocks {
         let mut txs = Vec::with_capacity(per_block);
@@ -135,17 +134,26 @@ fn main() {
     let v = chain.verify_parallel(&signed[0]);
     assert!(v.iter().all(|r| r.is_ok()));
     println!("signature check alone: {:.0} tx/s", per_block as f64 / t.elapsed().as_secs_f64());
-    let start = Instant::now();
-    let mut ok = 0;
-    for txs in signed {
-        let out = apply(&mut chain, txs);
-        ok += out.results.iter().filter(|r| r.is_ok()).count();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut signed = signed.into_iter();
+    for pre_verified in [false, true] {
+        let start = Instant::now();
+        let mut ok = 0;
+        for txs in signed.by_ref().take(blocks / 2) {
+            let out = apply(&mut chain, &mut height, txs, pre_verified);
+            ok += out.results.iter().filter(|r| r.is_ok()).count();
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let total = blocks / 2 * per_block;
+        let what = if pre_verified { "pre-verified (pipeline)" } else { "verified at execution" };
+        println!("{what}: {total} txs in {secs:.3}s → {:.0} tx/s ({ok} ok) on {threads} threads", total as f64 / secs);
     }
-    let secs = start.elapsed().as_secs_f64();
-    let total = blocks * per_block;
-    println!(
-        "{total} signed txs in {blocks} blocks: {secs:.3}s → {:.0} tx/s ({ok} ok) on {} threads",
-        total as f64 / secs,
-        std::thread::available_parallelism().map_or(1, |n| n.get())
-    );
+}
+
+fn apply(chain: &mut Chain, height: &mut u64, txs: Vec<Tx>, pre_verified: bool) -> BlockOutcome {
+    *height += 1;
+    let block = Block { height: *height, timestamp_ms: *height as i64 * 1_000, txs };
+    let known = vec![pre_verified; block.txs.len()];
+    let verified = chain.verify_parallel_except(&block.txs, &known);
+    chain.apply_verified_block(&block, verified).unwrap()
 }

@@ -3302,6 +3302,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures-util",
  "hex",
+ "libc",
  "mee",
  "mee-chain",
  "mee-consensus",
@@ -3332,6 +3333,7 @@ dependencies = [
  "mee-consensus",
  "mee-core",
  "mee-engine",
+ "sha2 0.10.9",
 ]
 
 [[package]]

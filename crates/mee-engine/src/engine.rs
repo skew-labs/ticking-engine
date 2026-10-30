@@ -35,7 +35,7 @@ pub struct PlaceOutcome {
     pub resting: u64,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, borsh::BorshSerialize)]
 pub enum CancelReason {
     User,
     SelfTrade,
@@ -43,12 +43,14 @@ pub enum CancelReason {
     MarketHalted,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// Borsh-encoded into the app hash (`side` fields as their `u8` code).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, borsh::BorshSerialize)]
 pub enum Event {
     Placed {
         market: MarketId,
         order_id: OrderId,
         account: AccountId,
+        #[borsh(serialize_with = "ser_side")]
         side: Side,
         price: u64,
         size: u64,
@@ -58,6 +60,7 @@ pub enum Event {
         maker_order: OrderId,
         maker: AccountId,
         taker: AccountId,
+        #[borsh(serialize_with = "ser_side")]
         taker_side: Side,
         price: u64,
         size: u64,
@@ -129,6 +132,10 @@ pub enum Event {
 }
 
 /// Owner key of the protocol account that runs protocol DEXes.
+fn ser_side<W: std::io::Write>(side: &Side, w: &mut W) -> std::io::Result<()> {
+    w.write_all(&[*side as u8])
+}
+
 pub const PROTOCOL_KEY: Key = [0xFE; 32];
 
 pub type Events = Vec<Event>;

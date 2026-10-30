@@ -15,12 +15,15 @@
 //!
 //! One task owns the node behind a mutex; network readers feed it through a
 //! bounded channel and per-connection writer tasks drain bounded queues
-//! (consensus tolerates the drops a full queue causes).
+//! (consensus tolerates the drops a full queue causes). Transactions take a
+//! detour through the signature stage (`sigverify`), which checks them in
+//! batches on the other cores, so the node task only does stateful checks.
 
 pub mod api;
 pub mod config;
 pub mod observer;
 pub mod relayer;
+pub mod sigverify;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -66,6 +69,8 @@ pub struct NetConfig {
     pub solana: Option<observer::SolanaConfig>,
     /// API requests per second per client IP (0 = unlimited).
     pub api_rate_per_sec: u32,
+    /// Signature stage threads and core pinning.
+    pub sigverify: sigverify::Options,
 }
 
 type Frame = Arc<Vec<u8>>;
@@ -96,8 +101,7 @@ impl Peers {
 }
 
 enum Input {
-    Peer(Pubkey, Wire),
-    Submit(Tx, oneshot::Sender<bool>),
+    Peer(Pubkey, Box<Wire>),
     /// An attestation this node signed.
     Attest(observer::SignedFact),
 }
@@ -109,6 +113,8 @@ pub struct Shared {
     key: SigningKey,
     peers: Mutex<Peers>,
     inbox: mpsc::Sender<Input>,
+    /// Entry of the signature stage (transactions from the API and peers).
+    verify_in: std::sync::mpsc::SyncSender<(Tx, sigverify::Origin)>,
     /// JSON of each committed block, for WebSocket subscribers.
     pub blocks: broadcast::Sender<Arc<str>>,
     /// Highest height published on `blocks`.
@@ -134,10 +140,11 @@ impl Shared {
         v
     }
 
-    /// Admits a transaction locally and gossips it on success.
+    /// Admits a transaction locally and gossips it on success. `false` also
+    /// when the signature stage is saturated (the client should retry).
     pub async fn submit(&self, tx: Tx) -> bool {
         let (reply, rx) = oneshot::channel();
-        if self.inbox.send(Input::Submit(tx, reply)).await.is_err() {
+        if self.verify_in.try_send((tx, sigverify::Origin::Api(reply))).is_err() {
             return false;
         }
         rx.await.unwrap_or(false)
@@ -178,6 +185,8 @@ pub async fn start(cfg: NetConfig, p2p: TcpListener, api: TcpListener) -> std::i
         }
     };
     let (inbox, rx) = mpsc::channel(1 << 16);
+    let (checked_tx, checked_rx) = mpsc::channel(1 << 10);
+    let verify_in = sigverify::spawn(chain_id, cfg.sigverify, checked_tx);
     let published = AtomicU64::new(node.height());
     let shared = Arc::new(Shared {
         node: Mutex::new(node),
@@ -185,6 +194,7 @@ pub async fn start(cfg: NetConfig, p2p: TcpListener, api: TcpListener) -> std::i
         key: cfg.key,
         peers: Mutex::new(Peers::default()),
         inbox,
+        verify_in,
         blocks: broadcast::channel(1024).0,
         published,
         pool: Mutex::new(observer::Pool::default()),
@@ -192,7 +202,7 @@ pub async fn start(cfg: NetConfig, p2p: TcpListener, api: TcpListener) -> std::i
     });
     let (p2p_addr, api_addr) = (p2p.local_addr()?, api.local_addr()?);
     let mut tasks = vec![
-        tokio::spawn(run_node(shared.clone(), rx, start_outs)),
+        tokio::spawn(run_node(shared.clone(), rx, checked_rx, start_outs)),
         tokio::spawn(accept_loop(shared.clone(), p2p)),
         tokio::spawn(api::serve(shared.clone(), api)),
     ];
@@ -266,7 +276,12 @@ async fn run_conn(shared: Arc<Shared>, mut stream: TcpStream) -> std::io::Result
             let body = opener.read(&mut rd).await?;
             let msg =
                 Wire::try_from_slice(&body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            if shared.inbox.send(Input::Peer(peer, msg)).await.is_err() {
+            if let Wire::Tx(tx) = msg {
+                // Gossip is best effort: a saturated signature stage drops it.
+                let _ = shared.verify_in.try_send((tx, sigverify::Origin::Peer(peer)));
+                continue;
+            }
+            if shared.inbox.send(Input::Peer(peer, Box::new(msg))).await.is_err() {
                 return Ok(());
             }
         }
@@ -312,7 +327,12 @@ impl SyncState {
     }
 }
 
-async fn run_node(shared: Arc<Shared>, mut rx: mpsc::Receiver<Input>, start_outs: Vec<NetOut>) {
+async fn run_node(
+    shared: Arc<Shared>,
+    mut rx: mpsc::Receiver<Input>,
+    mut checked: mpsc::Receiver<Vec<sigverify::Checked>>,
+    start_outs: Vec<NetOut>,
+) {
     dispatch(&shared, start_outs);
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -346,52 +366,75 @@ async fn run_node(shared: Arc<Shared>, mut rx: mpsc::Receiver<Input>, start_outs
                 let Some(input) = input else { return };
                 handle(&shared, &mut sync, input);
             }
+            batch = checked.recv() => {
+                let Some(batch) = batch else { return };
+                admit(&shared, batch);
+            }
         }
         publish(&shared);
     }
 }
 
+/// Admits a batch from the signature stage (one lock for the whole batch)
+/// and gossips what was new.
+fn admit(shared: &Shared, batch: Vec<sigverify::Checked>) {
+    let mut gossip = Vec::new();
+    {
+        let mut node = shared.node.lock().unwrap();
+        for c in batch {
+            let ok = node.submit_verified(c.tx.clone(), c.id, c.sig_verified);
+            let except = match c.origin {
+                sigverify::Origin::Api(reply) => {
+                    let _ = reply.send(ok);
+                    None
+                }
+                sigverify::Origin::Peer(from) => Some(from),
+            };
+            if ok {
+                gossip.push((c.tx, except));
+            }
+        }
+    }
+    let peers = shared.peers.lock().unwrap();
+    for (tx, except) in gossip {
+        peers.broadcast(&Arc::new(wire::encode(&Wire::Tx(tx))), except.as_ref());
+    }
+}
+
 fn handle(shared: &Shared, sync: &mut SyncState, input: Input) {
     match input {
-        Input::Submit(tx, reply) => {
-            let ok = shared.node.lock().unwrap().submit_tx(tx.clone());
-            if ok {
-                let f = Arc::new(wire::encode(&Wire::Tx(tx)));
-                shared.peers.lock().unwrap().broadcast(&f, None);
-            }
-            let _ = reply.send(ok);
+        Input::Peer(from, wire) => handle_peer(shared, sync, from, *wire),
+        Input::Attest(s) => {
+            let f = Arc::new(wire::encode(&Wire::Attest(s.clone())));
+            shared.peers.lock().unwrap().broadcast(&f, None);
+            add_attestation(shared, s);
         }
-        Input::Peer(from, Wire::Tx(tx)) => {
-            if shared.node.lock().unwrap().submit_tx(tx.clone()) {
-                let f = Arc::new(wire::encode(&Wire::Tx(tx)));
-                shared.peers.lock().unwrap().broadcast(&f, Some(&from));
-            }
-        }
-        Input::Peer(from, Wire::Consensus(env)) => {
+    }
+}
+
+fn handle_peer(shared: &Shared, sync: &mut SyncState, from: Pubkey, msg: Wire) {
+    match msg {
+        Wire::Tx(_) => unreachable!("transactions go through the signature stage"),
+        Wire::Consensus(env) => {
             // Only the authenticated sender may speak for its key.
             if env.from == from {
                 let outs = shared.node.lock().unwrap().on_message(env, now_ms());
                 dispatch(shared, outs);
             }
         }
-        Input::Peer(from, Wire::Status { epoch, height }) => {
+        Wire::Status { epoch, height } => {
             sync.tips.insert(from, (epoch, height));
             maybe_sync(shared, sync, false);
         }
-        Input::Peer(from, Wire::SyncRequest(req)) => {
+        Wire::SyncRequest(req) => {
             let resp = shared.node.lock().unwrap().serve_sync(&req);
             if let Some(resp) = resp {
                 let f = Arc::new(wire::encode(&Wire::SyncResponse(resp)));
                 shared.peers.lock().unwrap().send(&from, &f);
             }
         }
-        Input::Attest(s) => {
-            let f = Arc::new(wire::encode(&Wire::Attest(s.clone())));
-            shared.peers.lock().unwrap().broadcast(&f, None);
-            add_attestation(shared, s);
-        }
-        Input::Peer(_, Wire::Attest(s)) => add_attestation(shared, s),
-        Input::Peer(_, Wire::SyncResponse(resp)) => {
+        Wire::Attest(s) => add_attestation(shared, s),
+        Wire::SyncResponse(resp) => {
             let res = shared.node.lock().unwrap().apply_sync(resp, now_ms());
             if let Ok(outs) = res {
                 dispatch(shared, outs);

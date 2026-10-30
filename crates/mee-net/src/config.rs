@@ -65,6 +65,12 @@ pub struct ValidatorConfig {
     /// Requests per second per client IP on the API (0 = unlimited).
     #[serde(default = "default_rate")]
     pub api_rate_per_sec: u32,
+    /// Signature-check threads (0 = one per core, minus one).
+    #[serde(default)]
+    pub sigverify_threads: usize,
+    /// Pin each signature-check thread to its own core (Linux).
+    #[serde(default)]
+    pub pin_cores: bool,
 }
 
 fn default_poll_ms() -> u64 {

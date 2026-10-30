@@ -68,6 +68,7 @@ async fn launch(i: u32, validators: u32, p2p: TcpListener, peers: Vec<SocketAddr
         peers,
         solana: None,
         api_rate_per_sec: 0,
+        sigverify: Default::default(),
     };
     mee_net::start(cfg, p2p, bind().await).await.unwrap()
 }

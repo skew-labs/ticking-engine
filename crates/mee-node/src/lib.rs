@@ -11,6 +11,10 @@
 //!   run it as observers and keep following the chain.
 //! - Network messages are `Envelope`s carrying the epoch and the sender's
 //!   key; node indices only exist inside one epoch's consensus instance.
+//! - Signatures are checked once, on the way into the mempool (the network
+//!   layer does that on all cores, see `submit_verified`). The node remembers
+//!   which user transactions it verified, so executing a committed block only
+//!   checks the ones it never saw.
 
 pub mod storage;
 
@@ -133,10 +137,73 @@ pub struct Node {
     epoch_tails: std::collections::BTreeMap<u64, (Vec<mee_consensus::Block>, mee_consensus::Block, Qc)>,
     /// Consensus genesis of the current epoch.
     epoch_genesis: Hash,
+    /// User transactions whose signatures this node has verified.
+    verified: VerifiedSet,
 }
 
+/// Transaction id: SHA-256 of the borsh encoding (streamed, no allocation).
 pub fn tx_hash(tx: &Tx) -> Hash {
-    crypto::sha256(&[&borsh::to_vec(tx).expect("borsh")])
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    tx.serialize(&mut h).expect("hashing can't fail");
+    h.finalize().into()
+}
+
+/// Ids of many transactions, across all cores when there are many.
+pub fn tx_hashes(txs: &[Tx]) -> Vec<Hash> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if threads == 1 || txs.len() < 1_024 {
+        return txs.iter().map(tx_hash).collect();
+    }
+    let chunk = txs.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> =
+            txs.chunks(chunk).map(|c| scope.spawn(move || c.iter().map(tx_hash).collect::<Vec<_>>())).collect();
+        parts.into_iter().flat_map(|p| p.join().expect("hash worker")).collect()
+    })
+}
+
+/// Ids are SHA-256 outputs, already uniform: hash a set of them by their
+/// first eight bytes instead of running SipHash over all 32.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut b = [0u8; 8];
+        let n = bytes.len().min(8);
+        b[..n].copy_from_slice(&bytes[..n]);
+        self.0 ^= u64::from_le_bytes(b);
+    }
+}
+
+type IdSet = std::collections::HashSet<Hash, std::hash::BuildHasherDefault<IdHasher>>;
+
+/// A bounded set of verified transaction ids: two generations, the older
+/// dropped when the newer fills. Forgetting an id only costs a re-check.
+#[derive(Default)]
+struct VerifiedSet {
+    cur: IdSet,
+    old: IdSet,
+}
+
+const VERIFIED_GENERATION: usize = 1 << 19;
+
+impl VerifiedSet {
+    fn insert(&mut self, id: Hash) {
+        if self.cur.len() >= VERIFIED_GENERATION {
+            self.old = std::mem::take(&mut self.cur);
+        }
+        self.cur.insert(id);
+    }
+
+    fn contains(&self, id: &Hash) -> bool {
+        self.cur.contains(id) || self.old.contains(id)
+    }
 }
 
 /// Recorded by the chain when the epoch starts (see
@@ -185,6 +252,7 @@ impl Node {
             committed: Vec::new(),
             epoch_tails: Default::default(),
             epoch_genesis,
+            verified: VerifiedSet::default(),
         }
     }
 
@@ -250,10 +318,26 @@ impl Node {
     /// newly admitted (the caller should gossip it on).
     pub fn submit_tx(&mut self, tx: Tx) -> bool {
         let id = tx_hash(&tx);
-        if self.mempool.len() >= MAX_MEMPOOL || self.in_pool.contains(&id) || self.chain.check_tx(&tx).is_err() {
+        self.submit_verified(tx, id, false)
+    }
+
+    /// `submit_tx` for a transaction whose id the caller computed and, with
+    /// `sig_verified`, whose user signature it already checked (the network
+    /// layer verifies in parallel batches before handing transactions to the
+    /// node). System transactions are always fully checked here.
+    pub fn submit_verified(&mut self, tx: Tx, id: Hash, sig_verified: bool) -> bool {
+        if self.mempool.len() >= MAX_MEMPOOL || self.in_pool.contains(&id) {
+            return false;
+        }
+        let ok = match &tx {
+            Tx::User(_) if sig_verified || self.verified.contains(&id) => self.chain.check_nonce(&tx),
+            _ => self.chain.check_tx(&tx),
+        };
+        if ok.is_err() {
             return false;
         }
         if let Tx::User(t) = &tx {
+            self.verified.insert(id);
             let state = &self.chain.state;
             let nonce = state.account_id(&t.signer).map_or(0, |a| state.accounts[a as usize].nonce);
             let pending = self.per_sender.get(&t.signer).copied().unwrap_or(0);
@@ -397,7 +481,13 @@ impl Node {
             Err(_) => (self.chain.timestamp_ms, Vec::new()),
         };
         let block = Block { height: self.chain.height + 1, timestamp_ms: ts, txs };
-        let out = self.chain.apply_block(&block).expect("height and time are derived locally");
+        let known: Vec<bool> = if block.txs.is_empty() {
+            Vec::new()
+        } else {
+            tx_hashes(&block.txs).iter().map(|id| self.verified.contains(id)).collect()
+        };
+        let verified = self.chain.verify_parallel_except(&block.txs, &known);
+        let out = self.chain.apply_verified_block(&block, verified).expect("height and time are derived locally");
         self.app_hashes.push(out.app_hash);
         self.outcomes.push(out);
         if self.outcomes.len() >= 2 * OUTCOME_RETENTION {
