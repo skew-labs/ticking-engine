@@ -52,6 +52,20 @@ flowchart LR
 
 병목은 실행 쪽, 그중에서도 ed25519 서명 검증이다. 서명 검증은 코어 수에 비례해서 늘어난다.
 
+**솔라나 프로그램 (SBF, 컴퓨트 유닛).** Anza platform-tools v1.58로 `sbpf-solana-solana` 대상으로 빌드한 `mee.so`(305KB)를 `solana-program-test`에서 실행해 잰 값이다(`scripts/build-sbf.sh cu`). 전체 프로그램 테스트가 SBF 바이너리에서도 통과한다. 모든 명령이 기본 한도(명령당 200k CU)보다 훨씬 아래다.
+
+| 명령 | CU (최대) |
+|---|---|
+| `CreateLaunch` (민트·볼트 계정 생성 포함) | 46k |
+| `LaunchBuy` / `LaunchSell` / `PoolSwap` | 29k / 21k / 22k |
+| `InitBridge` / `BridgeDeposit` | 33k / 15k |
+| `RequestWithdrawal` + `ApproveWithdrawal` (서명 4개, 한 트랜잭션) | 30k |
+| `FinalizeWithdrawal` (토큰 전송 CPI 포함) | 17k |
+| `Lock` / `Unlock` / `RotateValidators` | 4k / 4k / 6k |
+| 온체인 DEX `PlaceOrder` (101개 깊이 북에 대기 주문) | 6k |
+| 온체인 DEX 테이커 스윕 | 약 5.8k + **체결당 3.3k** → 200k CU에 58체결, 1.4M CU에 416체결 |
+| `Liquidate` / `DeployDex` | 11k / 34k |
+
 ## 3. 런치패드 → perp (솔라나 네이티브 상장)
 
 HIP-3는 "스테이크를 건 배포자가 시장을 연다"이다. 여기선 그것 말고 **시장이 스스로 상장 자격을 증명**하는 경로를 하나 더 둔다.
@@ -241,6 +255,8 @@ maintenance = Σ |base| · mark · MM%
 cargo test --workspace
 cargo test -p mee-consensus --release   # 합의 시뮬레이션
 cargo bench -p mee-engine && cargo bench -p mee-chain
+scripts/build-sbf.sh test               # 솔라나 프로그램을 SBF로 빌드하고, 프로그램 테스트를 그 바이너리로 실행
+scripts/build-sbf.sh cu                 # 명령별 컴퓨트 유닛 표
 ```
 
 | 크레이트 | 테스트 |
@@ -283,7 +299,6 @@ cargo bench -p mee-engine && cargo bench -p mee-chain
 
 ## 13. 한계와 다음 단계
 
-- **SBF 빌드와 CU 측정 미완:** 솔라나 platform-tools를 이 환경에서 받아 실행하는 게 권한 정책으로 막혀 있다. 프로그램 테스트는 네이티브(`solana-program-test`)로 돈다. `cargo build-sbf` 후 CU를 재야 한다.
 - **스냅샷 기반 신규 노드 동기화:** 스냅샷은 로컬 재시작용이다. 새 노드는 블록을 처음부터 받는다(검증된 구간 동기화). 검증인이 서명한 상태 루트로 스냅샷을 검증해서 받아오는 빠른 동기화가 다음 단계다. 동기화를 위해 커밋된 블록 전체를 메모리에 둔다(디스크 조회로 바꿔야 함).
 - **런치패드 TWAP 관찰:** 입금은 관찰자가 자동으로 증명하지만, 졸업/TWAP(`ListLaunch`, `LaunchOracle`)은 검증인들이 같은 값에 서명해야 하므로 관찰 지점을 결정적으로 정하는 온체인 체크포인트가 필요하다. 지금은 테스트 하네스가 증명한다.
 - **가십 토폴로지:** 풀 메시 전제다. 대규모 옵저버 네트워크에는 계층형 전파가 필요하다.

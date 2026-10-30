@@ -6,6 +6,8 @@
 //! pays the creator, the oracle follows pool swaps in bounded steps, and the
 //! OI cap tracks pool depth.
 
+mod common;
+
 use ed25519_dalek::SigningKey;
 use mee::launchpad::{self, Launch, LaunchParams};
 use mee::token;
@@ -33,7 +35,7 @@ impl Sol {
         let mut all: Vec<&Keypair> = vec![&self.ctx.payer];
         all.extend_from_slice(signers);
         let tx = Transaction::new_signed_with_payer(ixs, Some(&self.ctx.payer.pubkey()), &all, blockhash);
-        self.ctx.banks_client.process_transaction(tx).await.unwrap();
+        common::process(&self.ctx.banks_client, tx).await.unwrap();
     }
 
     async fn token_account(&mut self, mint: &Pubkey, owner: &Pubkey, amount: u64) -> Pubkey {
@@ -118,7 +120,9 @@ async fn graduated_token_gets_a_perp() {
     // --- Solana: launch, sell out, graduate ---
     let pid = mee::id();
     let mut pt = ProgramTest::new("mee", pid, processor!(mee::processor::process_instruction));
-    pt.prefer_bpf(false);
+    // With SBF_OUT_DIR set (holding mee.so from `cargo build-sbf`), run the
+    // compiled SBF program instead of the native build.
+    pt.prefer_bpf(std::env::var_os("SBF_OUT_DIR").is_some());
     let mut sol = Sol { ctx: pt.start_with_context().await, pid };
     set_upgrade_authority(&mut sol.ctx, &pid);
     let payer = sol.ctx.payer.pubkey();

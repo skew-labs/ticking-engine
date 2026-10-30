@@ -3,6 +3,8 @@
 //! (validator signatures via the Ed25519 precompile, possibly over several
 //! transactions) → finalize after the dispute window.
 
+mod common;
+
 use ed25519_dalek::SigningKey;
 use mee::bridge::{self, ASSET_QUOTE, Bridge, DepositRecord, WITHDRAWAL_CANCELLED, WITHDRAWAL_PAID, WithdrawalRecord};
 use mee::token;
@@ -31,7 +33,7 @@ impl Env {
         let mut all: Vec<&Keypair> = vec![&self.ctx.payer];
         all.extend_from_slice(signers);
         let tx = Transaction::new_signed_with_payer(ixs, Some(&self.ctx.payer.pubkey()), &all, blockhash);
-        self.ctx.banks_client.process_transaction(tx).await.map_err(|e| format!("{e:?}"))
+        common::process(&self.ctx.banks_client, tx).await
     }
 
     async fn fails(&mut self, ixs: &[Instruction], code: u32) {
@@ -131,7 +133,9 @@ impl Env {
 async fn setup() -> Env {
     let pid = mee::id();
     let mut pt = ProgramTest::new("mee", pid, processor!(mee::processor::process_instruction));
-    pt.prefer_bpf(false);
+    // With SBF_OUT_DIR set (holding mee.so from `cargo build-sbf`), run the
+    // compiled SBF program instead of the native build.
+    pt.prefer_bpf(std::env::var_os("SBF_OUT_DIR").is_some());
     let mut ctx = pt.start_with_context().await;
     set_upgrade_authority(&mut ctx, &pid);
     let validators: Vec<SigningKey> = (0..4u8).map(|i| SigningKey::from_bytes(&[60 + i; 32])).collect();
@@ -388,7 +392,9 @@ async fn only_the_upgrade_authority_initializes() {
     // Front-running init would let anyone install their own validator set.
     let pid = mee::id();
     let mut pt = ProgramTest::new("mee", pid, processor!(mee::processor::process_instruction));
-    pt.prefer_bpf(false);
+    // With SBF_OUT_DIR set (holding mee.so from `cargo build-sbf`), run the
+    // compiled SBF program instead of the native build.
+    pt.prefer_bpf(std::env::var_os("SBF_OUT_DIR").is_some());
     let mut ctx = pt.start_with_context().await;
     set_upgrade_authority(&mut ctx, &pid);
     let mut env = Env { ctx, pid, quote_mint: Pubkey::default(), validators: vec![] };

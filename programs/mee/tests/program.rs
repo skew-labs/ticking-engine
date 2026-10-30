@@ -1,6 +1,8 @@
 //! End-to-end tests: the program runs natively inside `solana-program-test`
 //! next to the real SPL Token program.
 
+mod common;
+
 use mee::instruction::{self as mi, AddMarketArgs, OrderArgs, ParamsArgs};
 use mee::state::{BOOK_SIZE, DEX_SIZE};
 use mee::token;
@@ -70,7 +72,18 @@ impl Env {
         let mut all: Vec<&Keypair> = vec![&self.ctx.payer];
         all.extend_from_slice(signers);
         let tx = Transaction::new_signed_with_payer(ixs, Some(&self.ctx.payer.pubkey()), &all, blockhash);
-        self.ctx.banks_client.process_transaction(tx).await.map_err(|e| format!("{e:?}"))
+        common::process(&self.ctx.banks_client, tx).await
+    }
+
+    /// Runs a transaction and returns the compute units it used.
+    async fn cu(&mut self, ixs: &[Instruction], signers: &[&Keypair]) -> u64 {
+        let blockhash = self.ctx.get_new_latest_blockhash().await.unwrap();
+        let mut all: Vec<&Keypair> = vec![&self.ctx.payer];
+        all.extend_from_slice(signers);
+        let tx = Transaction::new_signed_with_payer(ixs, Some(&self.ctx.payer.pubkey()), &all, blockhash);
+        let r = self.ctx.banks_client.process_transaction_with_metadata(tx).await.unwrap();
+        r.result.unwrap();
+        r.metadata.unwrap().compute_units_consumed
     }
 
     async fn ok(&mut self, ixs: &[Instruction], signers: &[&Keypair]) {
@@ -160,7 +173,9 @@ impl Env {
 async fn setup() -> Env {
     let pid = mee::id();
     let mut pt = ProgramTest::new("mee", pid, processor!(mee::processor::process_instruction));
-    pt.prefer_bpf(false);
+    // With SBF_OUT_DIR set (holding mee.so from `cargo build-sbf`), run the
+    // compiled SBF program instead of the native build.
+    pt.prefer_bpf(std::env::var_os("SBF_OUT_DIR").is_some());
     let mut ctx = pt.start_with_context().await;
     set_upgrade_authority(&mut ctx, &pid);
 
@@ -469,4 +484,43 @@ fn set_upgrade_authority(ctx: &mut ProgramTestContext, pid: &Pubkey) {
         rent_epoch: 0,
     };
     ctx.set_account(&mee::pda::program_data(pid), &account.into());
+}
+
+#[tokio::test]
+async fn compute_units_of_resting_orders_and_book_sweeps() {
+    // Meaningful with SBF_OUT_DIR (the compiled program); natively it just
+    // exercises the same paths.
+    let sbf = std::env::var_os("SBF_OUT_DIR").is_some();
+    let mut env = setup().await;
+    let (maker, _) = env.trader(100_000_000).await;
+    let (taker, _) = env.trader(100_000_000).await;
+    // A deep book: 100 resting asks, one lot each, one tick apart.
+    let depth = 100u64;
+    for chunk in (0..depth).collect::<Vec<_>>().chunks(10) {
+        let ixs: Vec<_> = chunk.iter().map(|i| env.order(&maker, 1, 0, PRICE + 10 + i, 1)).collect();
+        env.ok(&ixs, &[&maker]).await;
+    }
+    let rest = env.order(&maker, 1, 0, PRICE + 10 + depth, 1);
+    let cu_rest = env.cu(&[rest], &[&maker]).await;
+    let mut sweeps = Vec::new();
+    let mut next = PRICE + 10;
+    for fills in [1u64, 4, 16] {
+        next += fills;
+        let take = env.order(&taker, 0, 2, next - 1, fills);
+        sweeps.push((fills, env.cu(&[take], &[&taker]).await));
+    }
+    let per_fill = (sweeps[2].1 - sweeps[0].1) / (sweeps[2].0 - sweeps[0].0);
+    let base = sweeps[0].1 - per_fill;
+    eprintln!("MEE_CU_SUMMARY resting order into a {}-deep book: {cu_rest} CU", depth + 1);
+    for (f, cu) in &sweeps {
+        eprintln!("MEE_CU_SUMMARY taker sweep, {f} fills: {cu} CU");
+    }
+    eprintln!(
+        "MEE_CU_SUMMARY ≈ {base} CU + {per_fill} CU per fill → {} fills in 200k CU, {} in 1.4M CU",
+        (200_000 - base) / per_fill.max(1),
+        (1_400_000 - base) / per_fill.max(1)
+    );
+    if sbf {
+        assert!(cu_rest < 200_000 && sweeps.iter().all(|(_, cu)| *cu < 200_000), "fits the default budget");
+    }
 }

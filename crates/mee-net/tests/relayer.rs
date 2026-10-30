@@ -43,7 +43,9 @@ async fn now(ctx: &mut ProgramTestContext) -> i64 {
 async fn relayer_carries_a_chain_withdrawal_to_a_solana_payout() {
     let pid = mee::id();
     let mut pt = ProgramTest::new("mee", pid, processor!(mee::processor::process_instruction));
-    pt.prefer_bpf(false);
+    // With SBF_OUT_DIR set (holding mee.so from `cargo build-sbf`), run the
+    // compiled SBF program instead of the native build.
+    pt.prefer_bpf(std::env::var_os("SBF_OUT_DIR").is_some());
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.pubkey();
     // Payer is the upgrade authority (who alone may initialize).

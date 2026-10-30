@@ -2,6 +2,8 @@
 //! pool swaps with a TWAP accumulator → creator fee claim. Vault balances
 //! are checked against the launch's accounting after every step.
 
+mod common;
+
 use mee::launchpad::{self, Launch, LaunchParams, STATUS_COMPLETE, STATUS_CURVE, STATUS_POOL};
 use mee::token;
 use solana_keypair::Keypair;
@@ -35,7 +37,7 @@ impl Env {
         let mut all: Vec<&Keypair> = vec![&self.ctx.payer];
         all.extend_from_slice(signers);
         let tx = Transaction::new_signed_with_payer(ixs, Some(&self.ctx.payer.pubkey()), &all, blockhash);
-        self.ctx.banks_client.process_transaction(tx).await.map_err(|e| format!("{e:?}"))
+        common::process(&self.ctx.banks_client, tx).await
     }
 
     async fn funded(&mut self) -> Keypair {
@@ -108,7 +110,9 @@ impl Env {
 async fn setup() -> Env {
     let pid = mee::id();
     let mut pt = ProgramTest::new("mee", pid, processor!(mee::processor::process_instruction));
-    pt.prefer_bpf(false);
+    // With SBF_OUT_DIR set (holding mee.so from `cargo build-sbf`), run the
+    // compiled SBF program instead of the native build.
+    pt.prefer_bpf(std::env::var_os("SBF_OUT_DIR").is_some());
     let mut ctx = pt.start_with_context().await;
     set_upgrade_authority(&mut ctx, &pid);
     let mut env = Env { ctx, pid, usdc: Pubkey::default(), treasury: Pubkey::default() };

@@ -23,6 +23,8 @@
 cargo test --workspace
 cargo bench -p mee-engine   # 엔진 처리량
 cargo bench -p mee-chain    # 서명 검증 포함 체인 처리량
+scripts/build-sbf.sh test   # 솔라나 프로그램 SBF 빌드 + 그 바이너리로 프로그램 테스트
+scripts/build-sbf.sh cu     # 명령별 컴퓨트 유닛
 
 # 로컬 4검증인 devnet (P2P 26600+i, API 8600+i)
 cargo build --release -p mee-net
