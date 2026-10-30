@@ -58,6 +58,8 @@ impl Node {
             Tx::User(_) => chain.check_tx(tx).is_ok(),
             Tx::System(mee_chain::SystemTx::BridgeDeposit { deposit_id, .. }) => *deposit_id >= chain.next_deposit_id,
             Tx::System(mee_chain::SystemTx::Governance { nonce, .. }) => *nonce >= chain.governance_nonce,
+            Tx::System(mee_chain::SystemTx::ListLaunch { launch_id, .. }) => !chain.listings.contains_key(launch_id),
+            Tx::System(mee_chain::SystemTx::LaunchOracle { solana_slot, .. }) => *solana_slot > chain.last_oracle_slot,
         });
         if self.replica.queued_payloads() == 0 {
             let txs: Vec<Tx> = self.mempool.iter().take(self.max_block_txs).cloned().collect();

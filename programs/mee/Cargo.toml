@@ -21,6 +21,7 @@ solana-pubkey = { version = "4.2", features = ["curve25519"] }
 
 [dev-dependencies]
 mee-chain = { path = "../../crates/mee-chain" }
+mee-engine = { path = "../../crates/mee-engine" }
 ed25519-dalek.workspace = true
 solana-program-test = { version = "=4.2.2", features = ["agave-unstable-api"] }
 solana-keypair = "3"

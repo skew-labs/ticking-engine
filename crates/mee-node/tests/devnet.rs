@@ -50,6 +50,7 @@ impl Devnet {
             params: params(),
             validators: validators.iter().map(crypto::pubkey).collect(),
             timestamp_ms: 0,
+            launch: Default::default(),
         };
         let cfg = Config { base_timeout_ms: 200, max_timeout_ms: 2_000 };
         let nodes = validators

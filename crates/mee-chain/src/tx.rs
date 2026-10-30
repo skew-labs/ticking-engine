@@ -186,7 +186,32 @@ pub enum SystemTx {
     /// A quorum-signed governance action; `nonce` must equal the chain's
     /// governance nonce, so each signature set is used once.
     Governance { nonce: u64, action: Governance, attestations: Vec<Attestation> },
+    /// A launchpad token graduated on Solana: list its perp. `twap_scaled` is
+    /// the pool TWAP in quote atoms per token atom × `PRICE_SCALE`.
+    ListLaunch {
+        launch_id: u64,
+        mint: Pubkey,
+        creator: Pubkey,
+        symbol: [u8; 16],
+        twap_scaled: u128,
+        pool_quote: u64,
+        attestations: Vec<Attestation>,
+    },
+    /// Pool TWAPs and depths observed at Solana slot `solana_slot` (strictly
+    /// increasing, so an old batch can't be replayed).
+    LaunchOracle { solana_slot: u64, updates: Vec<LaunchObservation>, attestations: Vec<Attestation> },
 }
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct LaunchObservation {
+    pub launch_id: u64,
+    pub twap_scaled: u128,
+    pub pool_quote: u64,
+}
+
+/// Launchpad pool prices are quote atoms per token atom × 1e12 (same as the
+/// Solana program's `launchpad::PRICE_SCALE`).
+pub const PRICE_SCALE: u128 = 1_000_000_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Tx {

@@ -669,7 +669,7 @@ impl State {
         let d = self.dex(dex)?;
         match a {
             Some(a) if d.deployer == a && d.status == DEX_ACTIVE => {}
-            None if d.status == DEX_FROZEN => {}
+            None if d.status == DEX_FROZEN || d.attested_oracle => {}
             _ => return Err(Error::NotOrderOwner),
         }
         if price == 0 || !within_bps(price, market.oracle_price, self.params.max_oracle_move_bps) {

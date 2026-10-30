@@ -52,6 +52,34 @@ pub fn withdrawal_message(chain_id: u64, id: u64, asset: u8, destination: &Pubke
     sha256(&[b"MEE/withdraw", &chain_id.to_le_bytes(), &id.to_le_bytes(), &[asset], destination, &amount.to_le_bytes()])
 }
 
+/// What validators sign to list a graduated launchpad token as a perp.
+pub fn list_message(
+    chain_id: u64,
+    launch_id: u64,
+    mint: &Pubkey,
+    creator: &Pubkey,
+    symbol: &[u8; 16],
+    twap_scaled: u128,
+    pool_quote: u64,
+) -> Hash {
+    sha256(&[
+        b"MEE/list",
+        &chain_id.to_le_bytes(),
+        &launch_id.to_le_bytes(),
+        mint,
+        creator,
+        symbol,
+        &twap_scaled.to_le_bytes(),
+        &pool_quote.to_le_bytes(),
+    ])
+}
+
+/// What validators sign for a batch of launchpad pool observations taken at
+/// Solana slot `slot`.
+pub fn launch_oracle_message(chain_id: u64, slot: u64, updates: &[u8]) -> Hash {
+    sha256(&[b"MEE/launch-oracle", &chain_id.to_le_bytes(), &slot.to_le_bytes(), updates])
+}
+
 /// What validators sign for a governance action (`body` is its encoding).
 pub fn governance_message(chain_id: u64, nonce: u64, body: &[u8]) -> Hash {
     sha256(&[b"MEE/governance", &chain_id.to_le_bytes(), &nonce.to_le_bytes(), body])

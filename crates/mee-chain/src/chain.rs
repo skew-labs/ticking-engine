@@ -3,18 +3,71 @@
 
 use mee_core::{EngineError, EngineParams, OrderKind, Side};
 use mee_engine::engine::Result as EngineResult;
-use mee_engine::{AccountId, CancelReason, Event, OrderRequest, State};
+use mee_engine::{AccountId, CancelReason, DexId, Event, MarketId, OrderRequest, State};
 use rustc_hash::FxHashMap;
 
 use crate::crypto::{self, Hash, Pubkey};
 use crate::tx::*;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Genesis {
     pub chain_id: u64,
     pub params: EngineParams,
     pub validators: Vec<Pubkey>,
     pub timestamp_ms: i64,
+    pub launch: LaunchMarkets,
+}
+
+/// Risk template for perps of graduated launchpad tokens. Conservative by
+/// default: these are young, thin tokens.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LaunchMarkets {
+    pub initial_margin_bps: u64,
+    pub maintenance_margin_bps: u64,
+    pub liquidation_fee_bps: u64,
+    pub funding_interval: i64,
+    pub max_funding_bps: u64,
+    /// Share of the protocol fee paid to the token's creator.
+    pub creator_fee_share_bps: u64,
+    /// Open interest notional allowed per unit of pool quote depth.
+    pub oi_cap_ratio_bps: u64,
+    /// A lot is the smallest power of ten of token atoms worth at least this
+    /// many quote atoms, so prices stay precise for tiny tokens.
+    pub min_lot_value: u64,
+}
+
+impl Default for LaunchMarkets {
+    fn default() -> Self {
+        LaunchMarkets {
+            initial_margin_bps: 2_000,
+            maintenance_margin_bps: 1_000,
+            liquidation_fee_bps: 500,
+            funding_interval: 3_600,
+            max_funding_bps: 100,
+            creator_fee_share_bps: 5_000,
+            oi_cap_ratio_bps: 20_000,
+            min_lot_value: 10_000,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Listing {
+    pub market: MarketId,
+    pub lot_atoms: u64,
+}
+
+/// Lot size (token atoms) and price per lot for a TWAP.
+pub fn lot_for(twap_scaled: u128, min_lot_value: u64) -> Option<(u64, u64)> {
+    let mut lot: u128 = 1;
+    for _ in 0..19 {
+        let price = twap_scaled.checked_mul(lot)? / PRICE_SCALE;
+        if price >= min_lot_value as u128 {
+            return Some((lot as u64, u64::try_from(price).ok()?));
+        }
+        lot *= 10;
+    }
+    None
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -28,6 +81,9 @@ pub enum TxError {
     GovernanceNonce,
     /// Not enough distinct, valid validator signatures.
     NoQuorum,
+    AlreadyListed,
+    /// Oracle batch from a Solana slot not after the last one.
+    StaleOracle,
     Engine(EngineError),
 }
 
@@ -68,6 +124,12 @@ pub struct Chain {
     pub governance_nonce: u64,
     /// Every withdrawal ever queued, by id (the Solana bridge dedups payouts).
     pub withdrawals: Vec<WithdrawalReceipt>,
+    pub launch: LaunchMarkets,
+    /// Protocol DEX holding launchpad perps, created with the first listing.
+    pub launch_dex: Option<DexId>,
+    /// Launch id → perp listing. Lookup only.
+    pub listings: FxHashMap<u64, Listing>,
+    pub last_oracle_slot: u64,
 }
 
 impl Chain {
@@ -86,6 +148,10 @@ impl Chain {
             next_withdrawal_id: 0,
             governance_nonce: 0,
             withdrawals: Vec::new(),
+            launch: g.launch,
+            launch_dex: None,
+            listings: FxHashMap::default(),
+            last_oracle_slot: 0,
         }
     }
 
@@ -111,6 +177,24 @@ impl Chain {
             }
             Tx::System(SystemTx::Governance { nonce, action, attestations }) => {
                 let msg = crypto::governance_message(self.chain_id, *nonce, &borsh::to_vec(action).expect("borsh"));
+                self.check_quorum(&msg, attestations)
+            }
+            Tx::System(SystemTx::ListLaunch {
+                launch_id,
+                mint,
+                creator,
+                symbol,
+                twap_scaled,
+                pool_quote,
+                attestations,
+            }) => {
+                let msg =
+                    crypto::list_message(self.chain_id, *launch_id, mint, creator, symbol, *twap_scaled, *pool_quote);
+                self.check_quorum(&msg, attestations)
+            }
+            Tx::System(SystemTx::LaunchOracle { solana_slot, updates, attestations }) => {
+                let msg =
+                    crypto::launch_oracle_message(self.chain_id, *solana_slot, &borsh::to_vec(updates).expect("borsh"));
                 self.check_quorum(&msg, attestations)
             }
         }
@@ -246,6 +330,69 @@ impl Chain {
                 self.governance_nonce += 1;
                 Ok(())
             }
+            Tx::System(SystemTx::ListLaunch { launch_id, creator, symbol, twap_scaled, pool_quote, .. }) => {
+                if self.listings.contains_key(launch_id) {
+                    return Err(TxError::AlreadyListed);
+                }
+                let c = self.launch;
+                let (lot_atoms, price) = lot_for(*twap_scaled, c.min_lot_value).ok_or(TxError::BadAction)?;
+                let cfg = mee_core::engine::MarketArgs {
+                    symbol: *symbol,
+                    tick_size: 1,
+                    min_base_lots: 1,
+                    initial_margin_bps: c.initial_margin_bps,
+                    maintenance_margin_bps: c.maintenance_margin_bps,
+                    liquidation_fee_bps: c.liquidation_fee_bps,
+                    oi_cap: self.oi_cap(*pool_quote, price),
+                    initial_price: price,
+                    funding_interval: c.funding_interval,
+                    max_funding_bps: c.max_funding_bps,
+                };
+                let dex = match self.launch_dex {
+                    Some(d) => d,
+                    None => {
+                        let d = self.state.create_protocol_dex(*b"launchpad\0\0\0\0\0\0\0", &mut out.events);
+                        self.launch_dex = Some(d);
+                        d
+                    }
+                };
+                let creator = self.state.account_or_create(creator);
+                let market =
+                    self.state.add_protocol_market(dex, cfg, creator, c.creator_fee_share_bps, &mut out.events)?;
+                self.listings.insert(*launch_id, Listing { market, lot_atoms });
+                Ok(())
+            }
+            Tx::System(SystemTx::LaunchOracle { solana_slot, updates, .. }) => {
+                if *solana_slot <= self.last_oracle_slot {
+                    return Err(TxError::StaleOracle);
+                }
+                let max_move = self.state.params.max_oracle_move_bps as u128;
+                let mut prices = Vec::new();
+                let mut caps = Vec::new();
+                for u in updates {
+                    let Some(l) = self.listings.get(&u.launch_id).copied() else { continue };
+                    let Ok(m) = self.state.market(l.market) else { continue };
+                    if m.status != mee_core::MARKET_ACTIVE {
+                        continue;
+                    }
+                    let target = (u.twap_scaled.saturating_mul(l.lot_atoms as u128) / PRICE_SCALE).max(1);
+                    // Memecoins move fast: follow in bounded steps instead of
+                    // rejecting the update.
+                    let cur = m.oracle_price as u128;
+                    let band = cur * max_move / 10_000;
+                    let price = target.clamp(cur.saturating_sub(band).max(1), cur + band) as u64;
+                    prices.push((l.market, price));
+                    caps.push((l.market, self.oi_cap(u.pool_quote, price)));
+                }
+                if let Some(dex) = self.launch_dex {
+                    self.state.set_oracle_attested(dex, &prices)?;
+                }
+                for (m, cap) in caps {
+                    self.state.set_oi_cap_attested(m, cap)?;
+                }
+                self.last_oracle_slot = *solana_slot;
+                Ok(())
+            }
             Tx::User(t) => {
                 // A valid signature with a fresh nonce consumes the nonce even
                 // if the action fails, so it can never be replayed.
@@ -253,6 +400,12 @@ impl Chain {
                 self.execute_action(&t.signer, &t.action, out)
             }
         }
+    }
+
+    /// Open interest cap in lots: `oi_cap_ratio` × pool quote depth.
+    fn oi_cap(&self, pool_quote: u64, price_per_lot: u64) -> u64 {
+        let notional = pool_quote as u128 * self.launch.oi_cap_ratio_bps as u128 / 10_000;
+        (notional / price_per_lot.max(1) as u128).clamp(1, u64::MAX as u128) as u64
     }
 
     fn account(&self, key: &Pubkey) -> Result<AccountId, TxError> {

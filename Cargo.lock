@@ -3138,6 +3138,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "mee-chain",
  "mee-core",
+ "mee-engine",
  "solana-keypair",
  "solana-program",
  "solana-program-test",

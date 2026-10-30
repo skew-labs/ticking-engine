@@ -46,6 +46,7 @@ impl Net {
             params: params(),
             validators: validators.iter().map(crypto::pubkey).collect(),
             timestamp_ms: 0,
+            launch: Default::default(),
         });
         Net { chain, validators, nonces: Default::default(), deposits: 0, ts: 0 }
     }

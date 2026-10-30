@@ -146,6 +146,7 @@ async fn deposit_attest_trade_withdraw_roundtrip() {
         params: mee_core::EngineParams::default(),
         validators: env.validators.iter().map(crypto::pubkey).collect(),
         timestamp_ms: 0,
+        launch: Default::default(),
     });
     let msg = crypto::deposit_message(CHAIN_ID, rec.id, &rec.owner, rec.asset, rec.amount);
     let attestations = [0usize, 1, 3]
