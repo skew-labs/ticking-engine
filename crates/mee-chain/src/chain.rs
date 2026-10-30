@@ -21,6 +21,23 @@ pub struct Genesis {
     pub bridge_program: Pubkey,
 }
 
+/// Trigger orders: per account and in total.
+pub const MAX_TRIGGERS_PER_ACCOUNT: usize = 32;
+pub const MAX_TRIGGERS: usize = 100_000;
+
+/// A resting take-profit / stop-loss (see `Action::PlaceTrigger`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Trigger {
+    pub account: AccountId,
+    pub market: MarketId,
+    pub side: Side,
+    pub above: bool,
+    pub trigger_price: u64,
+    pub limit_price: u64,
+    pub size: u64,
+    pub reduce_only: bool,
+}
+
 /// Share of a double-signing validator's stake (and its delegators') that is
 /// burned.
 pub const EQUIVOCATION_SLASH_BPS: u64 = 500;
@@ -114,6 +131,12 @@ pub enum TxError {
     /// Equivocation evidence that doesn't check out.
     BadEvidence,
     AlreadySlashed,
+    /// Some actions of a batch failed (the rest took effect).
+    PartialBatch {
+        failed: u16,
+    },
+    TooManyTriggers,
+    UnknownTrigger,
     Engine(EngineError),
 }
 
@@ -159,6 +182,8 @@ pub struct BlockOutcome {
     /// epoch, new set). The old set signs `crypto::valset_message` for the
     /// Solana bridge.
     pub validator_set: Option<(u64, Vec<(Pubkey, u64)>)>,
+    /// Trigger orders that fired at the start of this block: (id, result).
+    pub triggered: Vec<(u64, Result<(), TxError>)>,
     pub app_hash: Hash,
 }
 
@@ -206,6 +231,8 @@ pub struct Chain {
     pub slashed_validator_stake: u64,
     /// Set while applying a block that slashed someone (forces an election).
     slashed_in_block: bool,
+    pub triggers: std::collections::BTreeMap<u64, Trigger>,
+    pub next_trigger_id: u64,
     /// Voting weight of each validator (same order as `validators`): its
     /// stake at the election, or the genesis weight.
     pub validator_weights: Vec<u64>,
@@ -246,6 +273,8 @@ impl Chain {
             tombstoned: Default::default(),
             slashed_validator_stake: 0,
             slashed_in_block: false,
+            triggers: Default::default(),
+            next_trigger_id: 0,
             validator_weights: vec![g.staking.min_validator_stake.max(1); g.validators.len()],
             registered: g.validators.iter().copied().collect(),
         }
@@ -408,6 +437,7 @@ impl Chain {
 
         let _ = self.state.begin_block(block.timestamp_ms / 1_000, &mut out.events);
         self.release_unbonded();
+        self.fire_triggers(&mut out);
         for i in order {
             let tx = &block.txs[i];
             let r = verified[i].and_then(|_| self.check_nonce(tx)).and_then(|_| self.execute(tx, &mut out));
@@ -443,6 +473,9 @@ impl Chain {
         }
         for w in &out.withdrawals {
             h = crypto::sha256(&[&h, &borsh::to_vec(w).expect("borsh")]);
+        }
+        for t in &out.triggered {
+            h = crypto::sha256(&[&h, format!("{t:?}").as_bytes()]);
         }
         self.app_hash = h;
         out.app_hash = h;
@@ -626,6 +659,44 @@ impl Chain {
         self.slashed_in_block = true;
     }
 
+    /// Sends the trigger orders whose condition the current mark price
+    /// meets, in id order (marks are those at the start of the block).
+    fn fire_triggers(&mut self, out: &mut BlockOutcome) {
+        if self.triggers.is_empty() {
+            return;
+        }
+        let mut marks: Vec<Option<u64>> = vec![None; self.state.markets.len()];
+        let ids: Vec<u64> = self.triggers.keys().copied().collect();
+        for id in ids {
+            let t = self.triggers[&id];
+            let Ok(m) = self.state.market(t.market) else {
+                self.triggers.remove(&id);
+                continue;
+            };
+            if m.status != mee_core::MARKET_ACTIVE {
+                self.triggers.remove(&id); // halted or settled: nothing left to protect
+                continue;
+            }
+            let mark = *marks[t.market as usize].get_or_insert_with(|| self.state.mark_price(m));
+            let hit = if t.above { mark >= t.trigger_price } else { mark <= t.trigger_price };
+            if !hit {
+                continue;
+            }
+            self.triggers.remove(&id);
+            let req = OrderRequest {
+                market: t.market,
+                side: t.side,
+                kind: OrderKind::ImmediateOrCancel,
+                price: t.limit_price,
+                size: t.size,
+                reduce_only: t.reduce_only,
+                client_id: id,
+            };
+            let r = self.state.place_order(t.account, &req, &mut out.events).map(|_| ()).map_err(TxError::from);
+            out.triggered.push((id, r));
+        }
+    }
+
     fn release_unbonded(&mut self) {
         let now = self.timestamp_ms / 1_000;
         let (e, height) = (self.staking.epoch_blocks, self.height);
@@ -664,6 +735,17 @@ impl Chain {
             buf.extend_from_slice(k);
         }
         buf.extend_from_slice(&self.slashed_validator_stake.to_le_bytes());
+        buf.extend_from_slice(b"triggers");
+        buf.extend_from_slice(&self.next_trigger_id.to_le_bytes());
+        for (id, t) in &self.triggers {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&t.account.to_le_bytes());
+            buf.extend_from_slice(&t.market.to_le_bytes());
+            buf.extend_from_slice(&[t.side as u8, t.above as u8, t.reduce_only as u8]);
+            buf.extend_from_slice(&t.trigger_price.to_le_bytes());
+            buf.extend_from_slice(&t.limit_price.to_le_bytes());
+            buf.extend_from_slice(&t.size.to_le_bytes());
+        }
         for (v, w) in self.validators.iter().zip(&self.validator_weights) {
             buf.extend_from_slice(v);
             buf.extend_from_slice(&w.to_le_bytes());
@@ -730,6 +812,55 @@ impl Chain {
             Action::Cancel { market, order_id } => {
                 let a = self.account(signer)?;
                 self.state.cancel(a, *market, *order_id, &mut out.events)
+            }
+            Action::Modify { market, order_id, price, size, kind, reduce_only } => {
+                let a = self.account(signer)?;
+                let kind = OrderKind::from_u8(*kind).ok_or(TxError::BadAction)?;
+                self.state
+                    .modify_order(a, *market, *order_id, *price, *size, kind, *reduce_only, &mut out.events)
+                    .map(|_| ())
+            }
+            Action::Batch(items) => {
+                if items.len() > MAX_BATCH || items.iter().any(|i| matches!(i, Action::Batch(_))) {
+                    return Err(TxError::BadAction);
+                }
+                let failed = items.iter().filter(|i| self.execute_action(signer, i, out).is_err()).count();
+                return if failed == 0 { Ok(()) } else { Err(TxError::PartialBatch { failed: failed as u16 }) };
+            }
+            Action::PlaceTrigger { market, side, above, trigger_price, limit_price, size, reduce_only } => {
+                let a = self.account(signer)?;
+                self.state.market(*market)?;
+                let side = Side::from_u8(*side).ok_or(TxError::BadAction)?;
+                if *trigger_price == 0 || *limit_price == 0 || *size == 0 {
+                    return Err(TxError::BadAction);
+                }
+                let mine = self.triggers.values().filter(|t| t.account == a).count();
+                if mine >= MAX_TRIGGERS_PER_ACCOUNT || self.triggers.len() >= MAX_TRIGGERS {
+                    return Err(TxError::TooManyTriggers);
+                }
+                let t = Trigger {
+                    account: a,
+                    market: *market,
+                    side,
+                    above: *above,
+                    trigger_price: *trigger_price,
+                    limit_price: *limit_price,
+                    size: *size,
+                    reduce_only: *reduce_only,
+                };
+                self.triggers.insert(self.next_trigger_id, t);
+                self.next_trigger_id += 1;
+                Ok(())
+            }
+            Action::CancelTrigger { id } => {
+                let a = self.account(signer)?;
+                match self.triggers.get(id) {
+                    Some(t) if t.account == a => {
+                        self.triggers.remove(id);
+                        Ok(())
+                    }
+                    _ => return Err(TxError::UnknownTrigger),
+                }
             }
             Action::CancelAll { market } => {
                 let a = self.account(signer)?;

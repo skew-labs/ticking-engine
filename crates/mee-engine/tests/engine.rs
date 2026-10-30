@@ -547,3 +547,41 @@ fn protocol_market_pays_creator_and_takes_attested_prices() {
     assert_eq!(e.s.dexes[pdex as usize].deployer_fees, 0);
     check_invariants(&e.s, e.net_in);
 }
+
+#[test]
+fn modify_keeps_priority_when_shrinking_and_restores_on_failure() {
+    let mut e = Env::new();
+    let (a, b, c) = (e.trader(1, 100_000), e.trader(2, 100_000), e.trader(3, 1_000_000));
+    let ida = e.order(a, Side::Ask, OrderKind::Limit, PRICE + 10, 5).unwrap().order_id.unwrap();
+    let idb = e.order(b, Side::Ask, OrderKind::Limit, PRICE + 10, 5).unwrap().order_id.unwrap();
+    let book_ids = |e: &Env| e.s.markets[e.m as usize].book.iter(Side::Ask).map(|o| o.id).collect::<Vec<_>>();
+
+    // Shrinking at the same price: still first in the queue.
+    let r = e.s.modify_order(a, e.m, ida, PRICE + 10, 3, OrderKind::Limit, false, &mut e.ev).unwrap();
+    assert_eq!((r.order_id, r.resting), (Some(ida), 3));
+    assert_eq!(book_ids(&e), vec![ida, idb]);
+    assert_eq!(e.pos(a).open_asks, 3);
+
+    // A replace that fails (too large for a's margin) changes nothing at all,
+    // not even a's place in the queue.
+    let before = format!("{:?}{:?}", book_ids(&e), e.s.accounts[a as usize]);
+    let digest = e.s.markets[e.m as usize].book.digest();
+    let err = e.s.modify_order(a, e.m, ida, PRICE + 20, 5_000, OrderKind::Limit, false, &mut e.ev);
+    assert_eq!(err, Err(EngineError::InsufficientMargin));
+    assert_eq!(format!("{:?}{:?}", book_ids(&e), e.s.accounts[a as usize]), before);
+    assert_eq!(e.s.markets[e.m as usize].book.digest(), digest, "book commitment restored");
+    // Someone else's order can't be modified.
+    let err = e.s.modify_order(b, e.m, ida, PRICE + 10, 1, OrderKind::Limit, false, &mut e.ev);
+    assert_eq!(err, Err(EngineError::NotOrderOwner));
+
+    // Repricing moves it: a new id at the back of the new level.
+    let r = e.s.modify_order(a, e.m, ida, PRICE + 5, 4, OrderKind::Limit, false, &mut e.ev).unwrap();
+    let new_id = r.order_id.unwrap();
+    assert_ne!(new_id, ida);
+    assert_eq!(book_ids(&e), vec![new_id, idb]);
+    assert_eq!(e.pos(a).open_asks, 4);
+    // A taker hits the repriced order first.
+    e.order(c, Side::Bid, OrderKind::ImmediateOrCancel, PRICE + 10, 6).unwrap();
+    assert_eq!(e.pos(a).base, -4);
+    assert_eq!(e.pos(b).base, -2);
+}

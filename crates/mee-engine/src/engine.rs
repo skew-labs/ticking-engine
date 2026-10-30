@@ -1026,6 +1026,69 @@ impl State {
         Ok(())
     }
 
+    /// Atomic cancel-replace of a resting order (same side and client id).
+    /// Shrinking at the same price reduces the order in place and keeps its
+    /// time priority. Otherwise the old order is cancelled and the new one
+    /// placed; if placing fails, the old order is put back exactly where it
+    /// was and nothing changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn modify_order(
+        &mut self,
+        a: AccountId,
+        m: MarketId,
+        order_id: OrderId,
+        price: u64,
+        size: u64,
+        kind: OrderKind,
+        reduce_only: bool,
+        out: &mut Events,
+    ) -> Result<PlaceOutcome> {
+        let market = self.active_market(m)?;
+        let o = *market.book.get(order_id).ok_or(Error::OrderNotFound)?;
+        if o.account != a {
+            return Err(Error::NotOrderOwner);
+        }
+        let (dex, min_lots) = (market.dex, market.cfg.min_base_lots);
+        if price == o.price && size <= o.remaining && kind != OrderKind::ImmediateOrCancel {
+            if size == 0 || (!reduce_only && size < min_lots) {
+                return Err(Error::InvalidSize);
+            }
+            if size < o.remaining {
+                self.markets[m as usize].book.reduce(order_id, o.remaining - size);
+                self.release_open(a, dex, m, o.side, o.remaining - size);
+            }
+            return Ok(PlaceOutcome { order_id: Some(order_id), resting: size, ..PlaceOutcome::default() });
+        }
+        let behind = market.book.next_in_level(order_id);
+        self.markets[m as usize].book.remove(order_id);
+        self.release_open(a, dex, m, o.side, o.remaining);
+        let req = OrderRequest { market: m, side: o.side, kind, price, size, reduce_only, client_id: o.client_id };
+        let mut events = Vec::new();
+        match self.place_order(a, &req, &mut events) {
+            Ok(r) => {
+                out.push(Event::Canceled {
+                    market: m,
+                    order_id,
+                    account: a,
+                    remaining: o.remaining,
+                    reason: CancelReason::User,
+                });
+                out.extend(events);
+                Ok(r)
+            }
+            Err(e) => {
+                self.markets[m as usize].book.insert_before(o, behind);
+                let (mg, _) = self.accounts[a as usize].margin_mut(dex);
+                let p = mg.position_mut(m);
+                match o.side {
+                    Side::Bid => p.open_bids += o.remaining,
+                    Side::Ask => p.open_asks += o.remaining,
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Cancels every order of `a` in market `m`. O(orders in the book).
     pub fn cancel_all(&mut self, a: AccountId, m: MarketId, reason: CancelReason, out: &mut Events) -> Result<usize> {
         let market = self.market(m)?;

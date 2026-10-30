@@ -7,6 +7,7 @@
 //!   against the latest state root
 //! - `GET /withdrawals/{id}`: the receipt and this validator's signature
 //!   over the bridge message (a relayer collects a quorum of these)
+//! - `GET /triggers/{pubkey}`: the account's pending TP/SL orders
 //! - `GET /state_root/{height}`: the state root and this validator's
 //!   signature over it (light clients)
 //! - `GET /ws`: one JSON message per committed block (events, withdrawals,
@@ -90,6 +91,7 @@ pub async fn serve(shared: Arc<Shared>, listener: TcpListener) {
         .route("/book/{market}", get(book))
         .route("/account/{key}", get(account))
         .route("/withdrawals/{id}", get(withdrawal))
+        .route("/triggers/{key}", get(triggers))
         .route("/state_root/{height}", get(state_root))
         .route("/ws", get(ws))
         .route("/metrics", get(metrics))
@@ -271,6 +273,30 @@ async fn account(State(s): S, Path(key): Path<String>) -> Response {
     .into_response()
 }
 
+async fn triggers(State(s): S, Path(key): Path<String>) -> Response {
+    let Some(owner) = parse_key(&key) else {
+        return err(StatusCode::BAD_REQUEST, "bad key");
+    };
+    let n = s.node.lock().unwrap();
+    let Some(a) = n.chain.state.account_id(&owner) else {
+        return err(StatusCode::NOT_FOUND, "no such account");
+    };
+    let list: Vec<Value> = n
+        .chain
+        .triggers
+        .iter()
+        .filter(|(_, t)| t.account == a)
+        .map(|(id, t)| {
+            json!({
+                "id": id, "market": t.market, "side": side(t.side), "above": t.above,
+                "trigger_price": t.trigger_price, "limit_price": t.limit_price, "size": t.size,
+                "reduce_only": t.reduce_only,
+            })
+        })
+        .collect();
+    Json(json!({ "triggers": list })).into_response()
+}
+
 async fn withdrawal(State(s): S, Path(id): Path<u64>) -> Response {
     // Receipt ids are sequential from 0, so the id is the index. Copy it out
     // and sign without holding the node lock.
@@ -397,6 +423,9 @@ pub fn block_json(height: u64, out: &BlockOutcome) -> Value {
         "state_root": h(&out.state_root),
         "txs": out.results.len(),
         "failed": out.results.iter().filter(|r| r.is_err()).count(),
+        "triggered": out.triggered.iter().map(|(id, r)| json!({
+            "id": id, "ok": r.is_ok(), "error": r.err().map(|e| format!("{e:?}")),
+        })).collect::<Vec<_>>(),
         "events": out.events.iter().map(event_json).collect::<Vec<_>>(),
         "withdrawals": out.withdrawals.iter().map(|w| json!({
             "id": w.id, "asset": w.asset, "destination": k58(&w.destination), "amount": w.amount.to_string(),

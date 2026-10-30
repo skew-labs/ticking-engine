@@ -463,3 +463,69 @@ fn double_votes_slash_the_validator_and_its_delegators() {
     let r = net.tx(bad, Action::RegisterValidator);
     assert_eq!(net.block(vec![r]).results, vec![Err(TxError::AlreadySlashed)]);
 }
+
+#[test]
+fn stop_loss_fires_on_the_mark_and_batches_report_partial_failure() {
+    let (mut net, dep, a, b) = setup();
+    // a goes long 10.
+    let txs = vec![net.tx(&b, order(0, 1, 1, PRICE, 10)), net.tx(&a, order(0, 0, 2, PRICE, 10))];
+    net.ok(txs);
+    assert_eq!(net.chain.state.accounts[1].margins[0].1.position(0).base, 10);
+
+    // Stop-loss below, take-profit above; b bids below to absorb the stop.
+    let stop = Action::PlaceTrigger {
+        market: 0,
+        side: 1,
+        above: false,
+        trigger_price: PRICE - 200,
+        limit_price: PRICE - 400,
+        size: 10,
+        reduce_only: true,
+    };
+    let tp = Action::PlaceTrigger {
+        market: 0,
+        side: 1,
+        above: true,
+        trigger_price: PRICE + 300,
+        limit_price: PRICE + 250,
+        size: 10,
+        reduce_only: true,
+    };
+    let txs = vec![net.tx(&a, stop), net.tx(&a, tp), net.tx(&b, order(0, 0, 1, PRICE - 300, 10))];
+    net.ok(txs);
+    assert_eq!(net.chain.triggers.len(), 2);
+    // Only the owner can cancel a trigger.
+    let steal = net.tx(&b, Action::CancelTrigger { id: 1 });
+    assert_eq!(net.block(vec![steal]).results, vec![Err(TxError::UnknownTrigger)]);
+
+    // The oracle drops: nothing fires in the block that moves it (marks are
+    // read at the start of a block), the stop fires at the start of the next.
+    let drop = net.tx(&dep, Action::SetOracle { dex: 0, prices: vec![(0, PRICE - 250)] });
+    let out = net.ok(vec![drop]);
+    assert!(out.triggered.is_empty());
+    let out = net.ok(vec![]);
+    assert_eq!(out.triggered, vec![(0, Ok(()))]);
+    assert_eq!(net.chain.state.accounts[1].margins[0].1.position(0).base, 0, "position closed at b's bid");
+    assert_eq!(net.chain.triggers.keys().copied().collect::<Vec<_>>(), vec![1]);
+    let cancel = net.tx(&a, Action::CancelTrigger { id: 1 });
+    net.ok(vec![cancel]);
+    assert!(net.chain.triggers.is_empty());
+
+    // A batch: two good orders and a bad one; the good ones stand.
+    let batch = Action::Batch(vec![
+        order(0, 1, 1, PRICE + 50, 1),
+        order(0, 1, 1, 0, 1), // price 0: rejected
+        order(0, 1, 1, PRICE + 60, 1),
+    ]);
+    assert_eq!(batch.priority(), 2, "all post-only: the post-only class");
+    let t = net.tx(&a, batch);
+    let out = net.block(vec![t]);
+    assert_eq!(out.results, vec![Err(TxError::PartialBatch { failed: 1 })]);
+    assert_eq!(net.chain.state.markets[0].book.depth(mee_core::Side::Ask, 5), vec![(PRICE + 50, 1), (PRICE + 60, 1)]);
+    // Bundling a cancel with a taker order doesn't move it into the cancel class.
+    let mixed = Action::Batch(vec![Action::CancelAll { market: 0 }, order(0, 0, 2, PRICE, 1)]);
+    assert_eq!(mixed.priority(), 3);
+    let nested = Action::Batch(vec![Action::Batch(vec![])]);
+    let t = net.tx(&a, nested);
+    assert_eq!(net.block(vec![t]).results, vec![Err(TxError::BadAction)]);
+}

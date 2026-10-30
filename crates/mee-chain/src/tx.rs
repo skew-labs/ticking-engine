@@ -141,7 +141,41 @@ pub enum Action {
     /// Makes the signer's key eligible for election. Signed by the key
     /// itself, so stake can't elect keys nobody controls.
     RegisterValidator,
+    // advanced trading
+    /// Atomic cancel-replace of a resting order; shrinking at the same price
+    /// keeps its queue position (see `mee_engine::State::modify_order`).
+    Modify {
+        market: u32,
+        order_id: u64,
+        price: u64,
+        size: u64,
+        kind: u8,
+        reduce_only: bool,
+    },
+    /// Up to `MAX_BATCH` actions in one signed transaction, run in order.
+    /// Each stands on its own: one failing doesn't undo the others (the
+    /// result reports how many failed). No nesting.
+    Batch(Vec<Action>),
+    /// Take-profit / stop-loss. Once the mark price is at or beyond
+    /// `trigger_price` (at or above it if `above`, else at or below), an
+    /// immediate-or-cancel order for `size` with worst price `limit_price` is
+    /// sent for the signer at the start of the next block.
+    PlaceTrigger {
+        market: u32,
+        side: u8,
+        above: bool,
+        trigger_price: u64,
+        limit_price: u64,
+        size: u64,
+        reduce_only: bool,
+    },
+    CancelTrigger {
+        id: u64,
+    },
 }
+
+/// Most actions in one `Action::Batch`.
+pub const MAX_BATCH: usize = 32;
 
 impl Action {
     /// Block ordering class: cancels run first, then post-only orders, then
@@ -149,7 +183,10 @@ impl Action {
     pub fn priority(&self) -> u8 {
         match self {
             Action::Cancel { .. } | Action::CancelAll { .. } => 1,
-            Action::PlaceOrder { kind: 1, .. } => 2,
+            Action::PlaceOrder { kind: 1, .. } | Action::Modify { kind: 1, .. } => 2,
+            // A batch runs in the latest class of anything in it, so bundling
+            // a cancel can't pull an order ahead of its class.
+            Action::Batch(items) => items.iter().map(Action::priority).max().unwrap_or(3),
             _ => 3,
         }
     }

@@ -121,6 +121,46 @@ impl Book {
         }
     }
 
+    /// The order queued right behind `id` at its price, if any.
+    pub fn next_in_level(&self, id: OrderId) -> Option<OrderId> {
+        let n = &self.slab[*self.index.get(&id)? as usize];
+        (n.next != NIL).then(|| self.slab[n.next as usize].order.id)
+    }
+
+    /// Puts `order` back in front of `before` (same side and price), or at
+    /// the back of its level if `before` is `None`: undoes a `remove`
+    /// without losing time priority.
+    pub fn insert_before(&mut self, order: Order, before: Option<OrderId>) {
+        let Some(&b) = before.and_then(|id| self.index.get(&id)) else {
+            return self.insert(order);
+        };
+        debug_assert!(!self.index.contains_key(&order.id));
+        self.digest.add(&crate::commit::order_hash(&order));
+        let prev = self.slab[b as usize].prev;
+        let node = Node { order, prev, next: b };
+        let idx = match self.free.pop() {
+            Some(i) => {
+                self.slab[i as usize] = node;
+                i
+            }
+            None => {
+                self.slab.push(node);
+                (self.slab.len() - 1) as u32
+            }
+        };
+        self.index.insert(order.id, idx);
+        self.slab[b as usize].prev = idx;
+        if prev != NIL {
+            self.slab[prev as usize].next = idx;
+        }
+        let level = self.levels_mut(order.side).get_mut(&order.price).expect("level of the order behind");
+        if level.head == b {
+            level.head = idx;
+        }
+        level.total += order.remaining;
+        level.count += 1;
+    }
+
     pub fn remove(&mut self, id: OrderId) -> Option<Order> {
         let idx = self.index.remove(&id)?;
         let Node { order, prev, next } = self.slab[idx as usize].clone();
