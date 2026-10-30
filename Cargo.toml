@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mee-core", "crates/mee-engine", "crates/mee-chain", "crates/mee-consensus", "crates/mee-node", "programs/mee"]
+members = ["crates/mee-core", "crates/mee-engine", "crates/mee-chain", "crates/mee-consensus", "crates/mee-node", "crates/mee-net", "programs/mee"]
 
 [workspace.package]
 edition = "2024"

@@ -62,6 +62,8 @@ pub enum SyncError {
 
 /// Blocks per sync response (soft limit).
 pub const SYNC_BATCH: usize = 256;
+/// Payload bytes per sync response (soft limit; one block may exceed it).
+pub const SYNC_BYTES: usize = 16 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetOut {
@@ -77,7 +79,9 @@ pub struct Node {
     pub epoch: u64,
     pub replica: Replica,
     pub chain: Chain,
-    mempool: Vec<Tx>,
+    /// (tx hash, tx); `in_pool` dedups gossip.
+    mempool: Vec<(Hash, Tx)>,
+    in_pool: std::collections::HashSet<Hash>,
     /// Messages for a future epoch, replayed once we switch.
     future: Vec<Envelope>,
     /// App hash after each applied height (index = height - 1).
@@ -92,6 +96,10 @@ pub struct Node {
     epoch_tails: std::collections::BTreeMap<u64, (Vec<mee_consensus::Block>, mee_consensus::Block, Qc)>,
     /// Consensus genesis of the current epoch.
     epoch_genesis: Hash,
+}
+
+pub fn tx_hash(tx: &Tx) -> Hash {
+    crypto::sha256(&[&borsh::to_vec(tx).expect("borsh")])
 }
 
 fn consensus_genesis(chain: &Chain) -> Hash {
@@ -129,6 +137,7 @@ impl Node {
             replica,
             chain,
             mempool: Vec::new(),
+            in_pool: Default::default(),
             future: Vec::new(),
             app_hashes: Vec::new(),
             outcomes: Vec::new(),
@@ -176,34 +185,49 @@ impl Node {
         Ok((node, outs))
     }
 
-    /// Admits a transaction to the local mempool if it passes stateless and
-    /// nonce checks against the current state.
+    /// Admits a transaction to the local mempool if it is new and passes
+    /// stateless and nonce checks against the current state. `true` means
+    /// newly admitted (the caller should gossip it on).
     pub fn submit_tx(&mut self, tx: Tx) -> bool {
-        if self.chain.check_tx(&tx).is_err() {
+        let id = tx_hash(&tx);
+        if self.in_pool.contains(&id) || self.chain.check_tx(&tx).is_err() {
             return false;
         }
-        self.mempool.push(tx);
+        self.in_pool.insert(id);
+        self.mempool.push((id, tx));
         true
     }
 
-    /// Transactions waiting locally (for gossip).
-    pub fn mempool(&self) -> &[Tx] {
-        &self.mempool
+    /// Transactions waiting locally.
+    pub fn mempool(&self) -> impl Iterator<Item = &Tx> {
+        self.mempool.iter().map(|(_, tx)| tx)
     }
 
     fn refill(&mut self, now_ms: u64) {
         // Drop what can no longer execute, then hand the replica a fresh
         // batch if it has none.
-        let chain = &self.chain;
-        self.mempool.retain(|tx| match tx {
-            Tx::User(_) => chain.check_tx(tx).is_ok(),
-            Tx::System(mee_chain::SystemTx::BridgeDeposit { deposit_id, .. }) => *deposit_id >= chain.next_deposit_id,
-            Tx::System(mee_chain::SystemTx::Governance { nonce, .. }) => *nonce >= chain.governance_nonce,
-            Tx::System(mee_chain::SystemTx::ListLaunch { launch_id, .. }) => !chain.listings.contains_key(launch_id),
-            Tx::System(mee_chain::SystemTx::LaunchOracle { solana_slot, .. }) => *solana_slot > chain.last_oracle_slot,
+        let (chain, in_pool) = (&self.chain, &mut self.in_pool);
+        self.mempool.retain(|(id, tx)| {
+            let keep = match tx {
+                Tx::User(_) => chain.check_tx(tx).is_ok(),
+                Tx::System(mee_chain::SystemTx::BridgeDeposit { deposit_id, .. }) => {
+                    *deposit_id >= chain.next_deposit_id
+                }
+                Tx::System(mee_chain::SystemTx::Governance { nonce, .. }) => *nonce >= chain.governance_nonce,
+                Tx::System(mee_chain::SystemTx::ListLaunch { launch_id, .. }) => {
+                    !chain.listings.contains_key(launch_id)
+                }
+                Tx::System(mee_chain::SystemTx::LaunchOracle { solana_slot, .. }) => {
+                    *solana_slot > chain.last_oracle_slot
+                }
+            };
+            if !keep {
+                in_pool.remove(id);
+            }
+            keep
         });
         if self.replica.is_validator() && self.replica.queued_payloads() == 0 {
-            let txs: Vec<Tx> = self.mempool.iter().take(self.max_block_txs).cloned().collect();
+            let txs: Vec<Tx> = self.mempool.iter().take(self.max_block_txs).map(|(_, tx)| tx.clone()).collect();
             let p = Payload { timestamp_ms: now_ms as i64, txs };
             self.replica.submit(borsh::to_vec(&p).expect("borsh"));
         }
@@ -286,6 +310,14 @@ impl Node {
         let end =
             self.committed[start..].iter().position(|(e, _)| *e != epoch).map_or(self.committed.len(), |p| start + p);
         let block = |i: usize| self.committed[i].1.clone();
+        let (mut batch, mut bytes) = (0, 0);
+        for (_, b) in &self.committed[start..end] {
+            bytes += b.payload.len();
+            if batch == SYNC_BATCH || (batch > 0 && bytes > SYNC_BYTES) {
+                break;
+            }
+            batch += 1;
+        }
         let witness = if epoch < self.epoch {
             self.epoch_tails.get(&epoch).map(|(tail, c, qc)| (tail.clone(), c.clone(), qc.clone()))
         } else {
@@ -294,14 +326,14 @@ impl Node {
                 .filter(|(c, _)| Some(c.parent()) == self.committed.last().map(|(_, b)| b.hash()))
                 .map(|(c, qc)| (Vec::new(), c.clone(), qc.clone()))
         };
-        // Prefer a cut near SYNC_BATCH proven by its next two blocks.
+        // Prefer a cut near `batch` proven by its next two blocks.
         let cut = (start..end.saturating_sub(2))
             .rev()
-            .filter(|&k| k < start + SYNC_BATCH)
-            .chain(start + SYNC_BATCH..end.saturating_sub(2))
+            .filter(|&k| k < start + batch)
+            .chain(start + batch..end.saturating_sub(2))
             .find(|&k| self.committed[k + 1].1.round == self.committed[k].1.round + 1);
         let (last, proof) = match (cut, witness) {
-            (_, Some((tail, certified, qc))) if end - start <= SYNC_BATCH => {
+            (_, Some((tail, certified, qc))) if end - start <= batch => {
                 (end - 1, CommitProof::Witness { tail, certified, qc })
             }
             (Some(k), _) => (k, CommitProof::Children(block(k + 1), block(k + 2))),

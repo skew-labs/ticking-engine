@@ -143,6 +143,9 @@ pub struct Replica {
     /// An ancestor we need before we can commit; re-requested every tick.
     missing: Option<Hash>,
     witness: Option<(Block, Qc)>,
+    /// Hashes of uncommitted blocks this replica voted for (see
+    /// `SafetyState::voted`).
+    voted: Vec<Hash>,
     mempool: VecDeque<Vec<u8>>,
     now: u64,
 }
@@ -171,13 +174,15 @@ impl Replica {
             history: VecDeque::new(),
             missing: None,
             witness: None,
+            voted: Vec::new(),
             mempool: VecDeque::new(),
             now: 0,
         }
     }
 
     pub fn safety_state(&self) -> SafetyState {
-        SafetyState { round: self.round, last_voted_round: self.last_voted_round, high_qc: self.high_qc.clone() }
+        let voted = self.voted.iter().filter_map(|h| self.blocks.get(h)).cloned().collect();
+        SafetyState { round: self.round, last_voted_round: self.last_voted_round, high_qc: self.high_qc.clone(), voted }
     }
 
     /// Rebuilds a replica after a restart from its persisted safety state
@@ -194,6 +199,13 @@ impl Replica {
         }
         while self.history.len() > 4 * REPUTATION_WINDOW {
             self.history.pop_front();
+        }
+        for b in safety.voted {
+            if b.round > self.committed_round {
+                let h = b.hash();
+                self.voted.push(h);
+                self.blocks.insert(h, b);
+            }
         }
         self.last_voted_round = safety.last_voted_round;
         self.proposed_round = safety.last_voted_round;
@@ -373,6 +385,7 @@ impl Replica {
         let extends_tc = tc.as_ref().is_some_and(|t| t.round + 1 == round && qc.round >= t.high_qc.round);
         if self.is_validator() && round == self.round && round > self.last_voted_round && (extends_qc || extends_tc) {
             self.last_voted_round = round;
+            self.voted.push(hash);
             out.push(Out::Persist(self.safety_state()));
             let vote =
                 Vote { block: hash, round, voter: self.id, signature: sign(&self.key, &vote_message(&hash, round)) };
@@ -573,5 +586,7 @@ impl Replica {
             self.history.pop_front();
         }
         self.commits.extend(chain);
+        let blocks = &self.blocks;
+        self.voted.retain(|h| blocks.get(h).is_some_and(|b| b.round > parent_round));
     }
 }

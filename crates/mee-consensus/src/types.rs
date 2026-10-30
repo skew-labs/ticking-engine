@@ -139,4 +139,9 @@ pub struct SafetyState {
     pub round: Round,
     pub last_voted_round: Round,
     pub high_qc: Qc,
+    /// Uncommitted blocks this replica voted for, by round. Every certified
+    /// block is thus on the disk of at least f+1 honest voters, so a
+    /// committed chain can always be completed even after the whole network
+    /// restarts (proposals extend QCs whose blocks nobody else may hold).
+    pub voted: Vec<Block>,
 }

@@ -97,8 +97,12 @@ mod tests {
             assert!(rec.safety.is_none() && rec.blocks.is_empty());
             st.append_block(0, &block(1)).unwrap();
             st.append_block(0, &block(2)).unwrap();
-            let s =
-                SafetyState { round: 5, last_voted_round: 4, high_qc: Qc { block: [1; 32], round: 3, votes: vec![] } };
+            let s = SafetyState {
+                round: 5,
+                last_voted_round: 4,
+                high_qc: Qc { block: [1; 32], round: 3, votes: vec![] },
+                voted: vec![block(3)],
+            };
             st.save_safety(0, &s).unwrap();
         }
         // Simulate a crash in the middle of appending a third record.

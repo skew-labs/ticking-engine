@@ -424,3 +424,28 @@ fn late_joiner_catches_up_by_verified_sync() {
     let h = net.assert_agreement();
     assert!(h as u64 > target);
 }
+
+#[test]
+fn whole_network_restart_resumes_from_disk() {
+    // Everyone goes down at once: the blocks certified but not yet committed
+    // exist only in the voters' persisted safety state, and the chain must
+    // still be completed from there.
+    let (base, dirs) = temp_dirs("full-restart", 4);
+    let mut net = Devnet::build(4, 4, vec![], Some(dirs), Staking::default());
+    let a = SigningKey::from_bytes(&[2; 32]);
+    net.deposit(&a, ASSET_QUOTE, 1_000_000);
+    net.run(1_000);
+    for i in 0..4 {
+        net.crash(i);
+    }
+    net.inbox.clear();
+    net.run(500);
+    let before = net.nodes.iter().map(|n| n.height()).max().unwrap();
+    for i in 0..4 {
+        net.restart(i);
+    }
+    net.run(3_000);
+    let heights = net.assert_agreement();
+    assert!(heights as u64 > before + 20, "progress after a full restart: {heights} vs {before}");
+    let _ = std::fs::remove_dir_all(&base);
+}
