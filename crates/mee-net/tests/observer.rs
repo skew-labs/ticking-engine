@@ -86,6 +86,7 @@ async fn validators_attest_solana_deposits_without_a_relayer() {
             data_dir: None,
             peers: addrs.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, a)| *a).collect(),
             solana: Some(SolanaConfig { rpc_url: rpc_url.clone(), poll: Duration::from_millis(100) }),
+            api_rate_per_sec: 0,
         };
         nodes.push(mee_net::start(cfg, l, TcpListener::bind("127.0.0.1:0").await.unwrap()).await.unwrap());
     }

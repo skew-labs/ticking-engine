@@ -18,6 +18,7 @@
 //! (consensus tolerates the drops a full queue causes).
 
 pub mod api;
+pub mod config;
 pub mod observer;
 pub mod wire;
 
@@ -62,6 +63,8 @@ pub struct NetConfig {
     pub peers: Vec<SocketAddr>,
     /// Watch the Solana bridge and attest deposits (validators).
     pub solana: Option<observer::SolanaConfig>,
+    /// API requests per second per client IP (0 = unlimited).
+    pub api_rate_per_sec: u32,
 }
 
 type Frame = Arc<Vec<u8>>;
@@ -111,6 +114,7 @@ pub struct Shared {
     pub published: AtomicU64,
     /// Attestations of Solana facts collected from validators.
     pub pool: Mutex<observer::Pool>,
+    pub api_rate_per_sec: u32,
 }
 
 impl Shared {
@@ -183,6 +187,7 @@ pub async fn start(cfg: NetConfig, p2p: TcpListener, api: TcpListener) -> std::i
         blocks: broadcast::channel(1024).0,
         published,
         pool: Mutex::new(observer::Pool::default()),
+        api_rate_per_sec: cfg.api_rate_per_sec,
     });
     let (p2p_addr, api_addr) = (p2p.local_addr()?, api.local_addr()?);
     let mut tasks = vec![

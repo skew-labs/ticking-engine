@@ -3,7 +3,7 @@
 //! - `POST /tx` `{"tx": "<hex borsh Tx>"}` -> `{"accepted": bool, "hash"}`
 //! - `GET /status`
 //! - `GET /book/{market}?depth=N`
-//! - `GET /account/{pubkey hex}`: balances, positions and a Merkle proof
+//! - `GET /account/{pubkey}` (base58 or hex): balances, positions and a Merkle proof
 //!   against the latest state root
 //! - `GET /withdrawals/{id}`: the receipt and this validator's signature
 //!   over the bridge message (a relayer collects a quorum of these)
@@ -11,10 +11,19 @@
 //!   signature over it (light clients)
 //! - `GET /ws`: one JSON message per committed block (events, withdrawals,
 //!   roots)
+//! - `GET /metrics`: Prometheus text format
 //!
-//! Integers that can exceed 2^53 are encoded as strings.
+//! Integers that can exceed 2^53 are encoded as strings. Each client IP gets
+//! a token bucket of `api_rate_per_sec` requests per second (burst 2x);
+//! beyond it requests get 429.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use axum::extract::ConnectInfo;
+use axum::middleware::{self, Next};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -35,7 +44,46 @@ use crate::Shared;
 
 type S = State<Arc<Shared>>;
 
+/// Per-IP token buckets.
+struct RateLimit {
+    per_sec: f64,
+    buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
+}
+
+impl RateLimit {
+    fn allow(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let burst = 2.0 * self.per_sec;
+        let mut b = self.buckets.lock().unwrap();
+        if b.len() > 100_000 {
+            b.retain(|_, (_, t)| now.duration_since(*t).as_secs() < 60);
+        }
+        let (tokens, last) = b.entry(ip).or_insert((burst, now));
+        *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * self.per_sec).min(burst);
+        *last = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+async fn limit(
+    State(rl): State<Arc<RateLimit>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if rl.per_sec > 0.0 && !rl.allow(addr.ip()) {
+        return err(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
+    next.run(req).await
+}
+
 pub async fn serve(shared: Arc<Shared>, listener: TcpListener) {
+    let rl = Arc::new(RateLimit { per_sec: shared.api_rate_per_sec as f64, buckets: Mutex::default() });
     let app = Router::new()
         .route("/tx", post(submit))
         .route("/status", get(status))
@@ -44,16 +92,59 @@ pub async fn serve(shared: Arc<Shared>, listener: TcpListener) {
         .route("/withdrawals/{id}", get(withdrawal))
         .route("/state_root/{height}", get(state_root))
         .route("/ws", get(ws))
-        .with_state(shared);
-    let _ = axum::serve(listener, app).await;
+        .route("/metrics", get(metrics))
+        .with_state(shared)
+        .layer(middleware::from_fn_with_state(rl, limit));
+    let _ = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await;
+}
+
+async fn metrics(State(s): S) -> Response {
+    let peers = s.peer_keys().len();
+    let pool = s.pool.lock().unwrap().len();
+    let n = s.node.lock().unwrap();
+    let (txs, failed) =
+        n.outcomes.last().map_or((0, 0), |o| (o.results.len(), o.results.iter().filter(|r| r.is_err()).count()));
+    let body = format!(
+        "# TYPE mee_height gauge\nmee_height {}\n\
+         # TYPE mee_epoch gauge\nmee_epoch {}\n\
+         # TYPE mee_consensus_round gauge\nmee_consensus_round {}\n\
+         # TYPE mee_is_validator gauge\nmee_is_validator {}\n\
+         # TYPE mee_validators gauge\nmee_validators {}\n\
+         # TYPE mee_peers gauge\nmee_peers {}\n\
+         # TYPE mee_mempool_txs gauge\nmee_mempool_txs {}\n\
+         # TYPE mee_attestation_pool gauge\nmee_attestation_pool {}\n\
+         # TYPE mee_last_block_txs gauge\nmee_last_block_txs {}\n\
+         # TYPE mee_last_block_failed_txs gauge\nmee_last_block_failed_txs {}\n\
+         # TYPE mee_next_deposit_id gauge\nmee_next_deposit_id {}\n\
+         # TYPE mee_withdrawals_total counter\nmee_withdrawals_total {}\n",
+        n.height(),
+        n.epoch,
+        n.replica.round,
+        n.replica.is_validator() as u8,
+        n.chain.validators.len(),
+        peers,
+        n.mempool().count(),
+        pool,
+        txs,
+        failed,
+        n.chain.next_deposit_id,
+        n.chain.withdrawals.len(),
+    );
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
 fn err(code: StatusCode, msg: &str) -> Response {
     (code, Json(json!({ "error": msg }))).into_response()
 }
 
+/// Hashes and signatures: hex.
 fn h(bytes: &[u8]) -> String {
     hex::encode(bytes)
+}
+
+/// Keys: base58, as on Solana.
+fn k58(key: &[u8]) -> String {
+    crate::config::b58(key)
 }
 
 #[derive(Deserialize)]
@@ -74,17 +165,17 @@ async fn submit(State(s): S, Json(body): Json<SubmitBody>) -> Response {
 }
 
 async fn status(State(s): S) -> Json<Value> {
-    let peers: Vec<String> = s.peer_keys().iter().map(|k| h(k)).collect();
+    let peers: Vec<String> = s.peer_keys().iter().map(|k| k58(k)).collect();
     let n = s.node.lock().unwrap();
     Json(json!({
         "chain_id": s.chain_id,
-        "node": h(&n.me),
+        "node": k58(&n.me),
         "height": n.height(),
         "epoch": n.epoch,
         "timestamp_ms": n.chain.timestamp_ms,
         "app_hash": h(&n.chain.app_hash),
         "state_root": h(&n.chain.state_root),
-        "validators": n.chain.committee().iter().map(|(k, w)| json!({ "key": h(k), "weight": w.to_string() })).collect::<Vec<_>>(),
+        "validators": n.chain.committee().iter().map(|(k, w)| json!({ "key": k58(k), "weight": w.to_string() })).collect::<Vec<_>>(),
         "is_validator": n.replica.is_validator(),
         "mempool": n.mempool().count(),
         "peers": peers,
@@ -117,8 +208,13 @@ async fn book(State(s): S, Path(market): Path<u32>, Query(q): Query<DepthQuery>)
     .into_response()
 }
 
+/// Keys are accepted as base58 (Solana style) or hex.
 fn parse_key(s: &str) -> Option<[u8; 32]> {
-    hex::decode(s.trim_start_matches("0x")).ok()?.try_into().ok()
+    let hex_key = s.strip_prefix("0x").unwrap_or(s);
+    if hex_key.len() == 64 {
+        return hex::decode(hex_key).ok()?.try_into().ok();
+    }
+    crate::config::parse_b58(s).ok()
 }
 
 async fn account(State(s): S, Path(key): Path<String>) -> Response {
@@ -163,7 +259,7 @@ async fn account(State(s): S, Path(key): Path<String>) -> Response {
         })
     });
     Json(json!({
-        "owner": h(&a.owner),
+        "owner": k58(&a.owner),
         "height": n.height(),
         "state_root": h(&n.chain.state_root),
         "balance": a.balance.to_string(),
@@ -189,10 +285,10 @@ async fn withdrawal(State(s): S, Path(id): Path<u64>) -> Response {
     Json(json!({
         "id": w.id,
         "asset": w.asset,
-        "destination": h(&w.destination),
+        "destination": k58(&w.destination),
         "amount": w.amount.to_string(),
         "message": h(&msg),
-        "signer": h(&s.me()),
+        "signer": k58(&s.me()),
         "signature": h(&s.sign(&msg)),
     }))
     .into_response()
@@ -211,7 +307,7 @@ async fn state_root(State(s): S, Path(height): Path<u64>) -> Response {
         "height": height,
         "state_root": h(&state_root),
         "app_hash": h(&app_hash),
-        "signer": h(&s.me()),
+        "signer": k58(&s.me()),
         "signature": h(&s.sign(&msg)),
     }))
     .into_response()
@@ -303,11 +399,11 @@ pub fn block_json(height: u64, out: &BlockOutcome) -> Value {
         "failed": out.results.iter().filter(|r| r.is_err()).count(),
         "events": out.events.iter().map(event_json).collect::<Vec<_>>(),
         "withdrawals": out.withdrawals.iter().map(|w| json!({
-            "id": w.id, "asset": w.asset, "destination": h(&w.destination), "amount": w.amount.to_string(),
+            "id": w.id, "asset": w.asset, "destination": k58(&w.destination), "amount": w.amount.to_string(),
         })).collect::<Vec<_>>(),
         "validator_set": out.validator_set.as_ref().map(|(epoch, v)| json!({
             "epoch": epoch,
-            "validators": v.iter().map(|(k, w)| json!({ "key": h(k), "weight": w.to_string() })).collect::<Vec<_>>(),
+            "validators": v.iter().map(|(k, w)| json!({ "key": k58(k), "weight": w.to_string() })).collect::<Vec<_>>(),
         })),
     })
 }

@@ -34,6 +34,14 @@ async fn http(addr: SocketAddr, method: &str, path: &str, body: Option<Value>) -
     serde_json::from_str(body).unwrap_or_else(|_| panic!("not json: {resp}"))
 }
 
+async fn http_text(addr: SocketAddr, path: &str) -> String {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).await.unwrap();
+    String::from_utf8(resp).unwrap()
+}
+
 async fn submit(addr: SocketAddr, tx: Tx) {
     let r = http(addr, "POST", "/tx", Some(json!({ "tx": hex::encode(borsh::to_vec(&tx).unwrap()) }))).await;
     assert_eq!(r["accepted"], true, "{r}");
@@ -59,6 +67,7 @@ async fn launch(i: u32, validators: u32, p2p: TcpListener, peers: Vec<SocketAddr
         data_dir: None,
         peers,
         solana: None,
+        api_rate_per_sec: 0,
     };
     mee_net::start(cfg, p2p, bind().await).await.unwrap()
 }
@@ -118,6 +127,13 @@ async fn four_validators_over_tcp_with_api_gossip_and_late_observer() {
         http(api[3], "GET", &format!("/account/{a_key}"), None).await["balance"] == "1000000"
     })
     .await;
+
+    // Solana-style base58 keys work too, and keys come back in base58.
+    let a58 = bs58::encode(crypto::pubkey(&a)).into_string();
+    let acct = http(api[0], "GET", &format!("/account/{a58}"), None).await;
+    assert_eq!((acct["balance"].as_str(), acct["owner"].as_str()), (Some("1000000"), Some(a58.as_str())));
+    let m = http_text(api[0], "/metrics").await;
+    assert!(m.contains("mee_validators 4") && m.contains("mee_next_deposit_id 3"), "{m}");
 
     let deploy =
         Action::DeployDex { name: [0; 16], fee_share_bps: 0, stake: 1_000, oracle_authority: crypto::pubkey(&dep) };
