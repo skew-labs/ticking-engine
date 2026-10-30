@@ -131,7 +131,7 @@ impl MerkleTree {
 pub fn verify_proof(root: &Hash, mut index: usize, leaf: &Hash, proof: &[Hash]) -> bool {
     let mut h = *leaf;
     for sib in proof {
-        h = if index % 2 == 0 { node(&h, sib) } else { node(sib, &h) };
+        h = if index.is_multiple_of(2) { node(&h, sib) } else { node(sib, &h) };
         index /= 2;
     }
     &h == root
@@ -331,8 +331,8 @@ mod tests {
         fresh.update(&changed.iter().copied().enumerate().collect::<Vec<_>>(), 13);
         t.update(&[(5, changed[5]), (12, changed[12])], 13);
         assert_eq!(t.root(), fresh.root());
-        for i in 0..13 {
-            assert!(verify_proof(&t.root(), i, &changed[i], &t.proof(i)));
+        for (i, leaf) in changed.iter().enumerate() {
+            assert!(verify_proof(&t.root(), i, leaf, &t.proof(i)));
         }
         assert!(!verify_proof(&t.root(), 5, &leaves[5], &t.proof(5)));
         // Growth past the padded size rebuilds correctly.
