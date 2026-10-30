@@ -6,6 +6,7 @@
 //! `mee-core`), so fills settle in the same instruction with no crank.
 //! Guardians can slash a misbehaving deployer's stake and freeze the DEX.
 
+pub mod bridge;
 pub mod error;
 pub mod instruction;
 pub mod pda;

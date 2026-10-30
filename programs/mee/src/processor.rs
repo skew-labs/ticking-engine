@@ -492,6 +492,14 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
             token::check_token_program(token_program)?;
             token::transfer(token_program, source, quote_vault, funder, amount, &[])
         }
+        MeeInstruction::InitBridge { chain_id, validators } => {
+            crate::bridge::init(program_id, it, chain_id, &validators)
+        }
+        MeeInstruction::BridgeDeposit { asset, amount } => crate::bridge::deposit(program_id, it, asset, amount),
+        MeeInstruction::BridgeWithdraw { id, asset, destination, amount } => {
+            crate::bridge::withdraw(program_id, it, id, asset, destination, amount)
+        }
+        MeeInstruction::RotateValidators { validators } => crate::bridge::rotate(program_id, it, &validators),
     }
 }
 

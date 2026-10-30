@@ -156,6 +156,19 @@ pub enum MeeInstruction {
     Liquidate { market: u8, liquidatee: [u8; 32], max_base: u64 },
     /// [funder (s), dex (w), funder_token (w), quote_vault (w), token_program]
     FundInsurance { amount: u64 },
+
+    // --- MEE chain bridge (see `bridge`) ----------------------------------------
+    /// [admin (s,w), bridge (w), quote_mint, stake_mint, quote_vault (w), stake_vault (w),
+    ///  authority, token_program, system_program, rent]
+    InitBridge { chain_id: u64, validators: Vec<[u8; 32]> },
+    /// [owner (s,w), bridge (w), deposit_record (w), source (w), vault (w), token_program,
+    ///  system_program, rent, clock]
+    BridgeDeposit { asset: u8, amount: u64 },
+    /// [payer (s,w), bridge, withdrawal_record (w), vault (w), destination_token (w), authority,
+    ///  instructions_sysvar, token_program, system_program, rent]
+    BridgeWithdraw { id: u64, asset: u8, destination: [u8; 32], amount: u64 },
+    /// [bridge (w), instructions_sysvar]
+    RotateValidators { validators: Vec<[u8; 32]> },
 }
 
 fn ix(program_id: &Pubkey, data: MeeInstruction, accounts: Vec<AccountMeta>) -> Instruction {
