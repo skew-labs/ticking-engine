@@ -181,6 +181,9 @@ async fn four_validators_over_tcp_with_api_gossip_and_late_observer() {
         }
     }
     assert_eq!(filled, 5);
+    // The fills came from node 3's stream; node 0 may be a block behind.
+    wait_for("node 0 applied the fills", 20, async || http(api[0], "GET", "/book/0", None).await["open_interest"] == 5)
+        .await;
     let book = http(api[0], "GET", "/book/0", None).await;
     assert_eq!(book["open_interest"], 5);
     assert_eq!(book["asks"][0], json!([10_002, 1]));
@@ -238,11 +241,13 @@ async fn four_validators_over_tcp_with_api_gossip_and_late_observer() {
     let liar_addr = observer.p2p_addr;
     let liar = tokio::spawn(async move {
         let mut s = TcpStream::connect(liar_addr).await.unwrap();
-        mee_net::wire::handshake(&mut s, &SigningKey::from_bytes(&[66; 32]), CHAIN).await.unwrap();
+        let (_, mut sealer, mut opener) =
+            mee_net::wire::handshake(&mut s, &SigningKey::from_bytes(&[66; 32]), CHAIN).await.unwrap();
         let (mut rd, mut wr) = s.into_split();
-        tokio::spawn(async move { while mee_net::wire::read_frame(&mut rd).await.is_ok() {} });
+        tokio::spawn(async move { while opener.read(&mut rd).await.is_ok() {} });
         loop {
-            let lie = mee_net::wire::encode(&mee_net::wire::Wire::Status { epoch: 0, height: u64::MAX / 2 });
+            let lie =
+                sealer.seal(&mee_net::wire::encode(&mee_net::wire::Wire::Status { epoch: 0, height: u64::MAX / 2 }));
             if wr.write_all(&lie).await.is_err() {
                 return;
             }

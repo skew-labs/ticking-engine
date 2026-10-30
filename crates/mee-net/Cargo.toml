@@ -20,6 +20,8 @@ mee = { path = "../../programs/mee", features = ["no-entrypoint"] }
 base64 = "0.22"
 bs58 = "0.5"
 bytemuck.workspace = true
+chacha20poly1305 = "0.10"
+x25519-dalek = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = { version = "0.8", features = ["ws"] }
 borsh.workspace = true

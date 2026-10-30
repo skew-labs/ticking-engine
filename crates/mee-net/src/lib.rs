@@ -229,7 +229,7 @@ async fn dial_loop(shared: Arc<Shared>, addr: SocketAddr) {
 /// Handshake, register, then pump frames both ways until either side fails.
 async fn run_conn(shared: Arc<Shared>, mut stream: TcpStream) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
-    let peer = wire::handshake(&mut stream, &shared.key, shared.chain_id).await?;
+    let (peer, mut sealer, mut opener) = wire::handshake(&mut stream, &shared.key, shared.chain_id).await?;
     let (mut rd, mut wr) = stream.into_split();
     let (q, mut out) = mpsc::channel::<Frame>(PEER_QUEUE);
     let id = {
@@ -246,15 +246,16 @@ async fn run_conn(shared: Arc<Shared>, mut stream: TcpStream) -> std::io::Result
     };
     shared.peers.lock().unwrap().send(&peer, &status);
     let writer = tokio::spawn(async move {
+        // Frames are encoded once per broadcast and encrypted per connection.
         while let Some(f) = out.recv().await {
-            if wr.write_all(&f).await.is_err() {
+            if wr.write_all(&sealer.seal(&f)).await.is_err() {
                 break;
             }
         }
     });
     let result = async {
         loop {
-            let body = wire::read_frame(&mut rd).await?;
+            let body = opener.read(&mut rd).await?;
             let msg =
                 Wire::try_from_slice(&body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             if shared.inbox.send(Input::Peer(peer, msg)).await.is_err() {
