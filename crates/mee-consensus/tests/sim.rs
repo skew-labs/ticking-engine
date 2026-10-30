@@ -92,3 +92,20 @@ fn randomized_fault_sweep_never_forks() {
         assert!(r.safe(), "fork with {cfg:?}");
     }
 }
+
+#[test]
+fn reputation_routes_around_a_crashed_validator() {
+    let honest = run(&SimConfig::default()).min_commits(0..4);
+    for crashed in 0..4u16 {
+        let r = run(&SimConfig { crashed: vec![crashed], ..SimConfig::default() });
+        assert!(r.safe());
+        let c = r.min_commits((0..4).filter(|&i| i != crashed as usize));
+        println!("crashed {crashed}: {c} commits vs {honest} honest");
+        // Without reputation every fourth round (and the one voting into it)
+        // times out (a few dozen commits here). With it the dead node is
+        // skipped after a short warm-up. The rest is structural: with 3 of 4
+        // alive the quorum needs every live node, so each round waits for the
+        // slowest link instead of the fastest three of four.
+        assert!(c * 2 >= honest, "crashed {crashed}: {c} vs {honest}");
+    }
+}

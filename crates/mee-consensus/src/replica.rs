@@ -13,6 +13,13 @@
 //!   its highest QC; 2f+1 timeouts form a TC that moves everyone on. f+1
 //!   timeouts for a round make a replica join (so slow timers can't stall).
 //!
+//! - Leader reputation: once enough blocks are committed, leaders rotate only
+//!   among validators that authored or voted in the last `REPUTATION_WINDOW`
+//!   committed blocks (looking only at blocks at least `REPUTATION_LAG`
+//!   rounds old, so honest replicas agree). A crashed validator stops being
+//!   chosen, so its rounds no longer time out. If too few are active, it
+//!   falls back to plain round robin.
+//!
 //! All collections that are iterated are vectors; hash maps are lookup only.
 
 use std::collections::VecDeque;
@@ -21,6 +28,9 @@ use ed25519_dalek::SigningKey;
 use rustc_hash::FxHashMap;
 
 use crate::types::*;
+
+pub const REPUTATION_WINDOW: usize = 10;
+pub const REPUTATION_LAG: u64 = 3;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Config {
@@ -53,6 +63,8 @@ pub struct Replica {
     pub committed_round: Round,
     last_committed: Hash,
     commits: Vec<Block>,
+    /// (round, author | QC voters) of committed blocks, in commit order.
+    history: VecDeque<(Round, u64)>,
     /// An ancestor we need before we can commit; re-requested every tick.
     missing: Option<Hash>,
     mempool: VecDeque<Vec<u8>>,
@@ -80,6 +92,7 @@ impl Replica {
             committed_round: 0,
             last_committed: genesis,
             commits: Vec::new(),
+            history: VecDeque::new(),
             missing: None,
             mempool: VecDeque::new(),
             now: 0,
@@ -87,7 +100,27 @@ impl Replica {
     }
 
     pub fn leader(&self, r: Round) -> NodeId {
-        (r % self.validators.len() as u64) as NodeId
+        let n = self.validators.len();
+        let cutoff = r.saturating_sub(REPUTATION_LAG);
+        let mut active = 0u64;
+        let mut seen = 0;
+        for &(round, mask) in self.history.iter().rev() {
+            if round > cutoff {
+                continue;
+            }
+            active |= mask;
+            seen += 1;
+            if seen == REPUTATION_WINDOW {
+                break;
+            }
+        }
+        if seen == REPUTATION_WINDOW {
+            let ids: Vec<NodeId> = (0..n as NodeId).filter(|&v| active & (1u64 << (v as u32 % 64)) != 0).collect();
+            if ids.len() >= quorum(n) {
+                return ids[(r % ids.len() as u64) as usize];
+            }
+        }
+        (r % n as u64) as NodeId
     }
 
     fn quorum(&self) -> usize {
@@ -412,6 +445,12 @@ impl Replica {
         chain.reverse();
         self.committed_round = parent_round;
         self.last_committed = parent;
+        for blk in &chain {
+            self.history.push_back((blk.round, blk.voter_mask() | (1u64 << (blk.author as u32 % 64))));
+        }
+        while self.history.len() > 4 * REPUTATION_WINDOW {
+            self.history.pop_front();
+        }
         self.commits.extend(chain);
     }
 }

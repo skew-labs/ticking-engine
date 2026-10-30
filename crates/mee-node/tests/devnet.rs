@@ -243,7 +243,7 @@ fn four_validators_agree() {
 
 #[test]
 fn agree_with_one_validator_down() {
-    // Round-robin leaders: rounds led by (or voting into) the dead node time
-    // out, so give each phase longer. Leader reputation would remove this.
-    scenario(vec![2], 4_000);
+    // Leader reputation skips the dead node once 10 blocks are committed, so
+    // after a short warm-up each phase needs little more than the honest case.
+    scenario(vec![2], 1_500);
 }

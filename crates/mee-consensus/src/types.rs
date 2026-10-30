@@ -69,14 +69,23 @@ pub struct Block {
 
 impl Block {
     pub fn hash(&self) -> Hash {
+        // The QC's voter set is part of the hash: leader reputation reads it,
+        // so nobody may swap it for another valid set in transit.
+        let mut voters: Vec<u8> = self.qc.votes.iter().flat_map(|(v, _)| v.to_le_bytes()).collect();
+        voters.sort_unstable();
         sha256(&[
             b"MEE/cblock",
             &self.round.to_le_bytes(),
             &self.author.to_le_bytes(),
             &self.qc.block,
             &self.qc.round.to_le_bytes(),
+            &voters,
             &sha256(&[&self.payload]),
         ])
+    }
+
+    pub fn voter_mask(&self) -> u64 {
+        self.qc.votes.iter().fold(0u64, |m, (v, _)| m | (1u64 << (*v as u32 % 64)))
     }
 
     pub fn parent(&self) -> Hash {
