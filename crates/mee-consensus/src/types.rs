@@ -1,3 +1,4 @@
+use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
@@ -41,7 +42,7 @@ pub fn proposal_message(block: &Hash) -> Hash {
 
 /// Quorum certificate: 2f+1 votes for `block` in `round`. The genesis QC
 /// (round 0) carries no votes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Qc {
     pub block: Hash,
     pub round: Round,
@@ -50,14 +51,14 @@ pub struct Qc {
 
 /// Timeout certificate: 2f+1 replicas gave up on `round`. Each entry signs
 /// (round, its high-QC round); `high_qc` is the highest of those.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Tc {
     pub round: Round,
     pub timeouts: Vec<(NodeId, Round, Sig)>,
     pub high_qc: Qc,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Block {
     pub round: Round,
     pub author: NodeId,
@@ -93,7 +94,7 @@ impl Block {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Vote {
     pub block: Hash,
     pub round: Round,
@@ -101,7 +102,7 @@ pub struct Vote {
     pub signature: Sig,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Timeout {
     pub round: Round,
     pub high_qc: Qc,
@@ -109,7 +110,7 @@ pub struct Timeout {
     pub signature: Sig,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Message {
     Propose {
         block: Block,
@@ -122,8 +123,20 @@ pub enum Message {
     Deliver(Block),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Out {
     Broadcast(Message),
     Send(NodeId, Message),
+    /// Write this to durable storage before sending anything that follows
+    /// it in the same output batch (it guards against double voting after a
+    /// restart).
+    Persist(SafetyState),
+}
+
+/// What a replica must remember across restarts to stay safe.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct SafetyState {
+    pub round: Round,
+    pub last_voted_round: Round,
+    pub high_qc: Qc,
 }

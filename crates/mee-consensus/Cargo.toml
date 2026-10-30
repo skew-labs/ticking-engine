@@ -8,5 +8,6 @@ publish.workspace = true
 
 [dependencies]
 ed25519-dalek.workspace = true
+borsh.workspace = true
 rustc-hash.workspace = true
 sha2.workspace = true

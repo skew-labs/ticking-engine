@@ -138,6 +138,7 @@ pub fn run(cfg: &SimConfig) -> SimResult {
                 push: &mut dyn FnMut(&mut Queue, &mut Slab, u64, Ev)| {
         for o in outs {
             let targets: Vec<(NodeId, Message)> = match o {
+                Out::Persist(_) => continue,
                 Out::Send(to, m) => vec![(to, m)],
                 Out::Broadcast(m) => {
                     let alt = match (&m, cfg.equivocator) {

@@ -99,6 +99,37 @@ impl Replica {
         }
     }
 
+    pub fn safety_state(&self) -> SafetyState {
+        SafetyState { round: self.round, last_voted_round: self.last_voted_round, high_qc: self.high_qc.clone() }
+    }
+
+    /// Rebuilds a replica after a restart from its persisted safety state
+    /// and the committed blocks it had logged (in order). It will not vote in
+    /// any round up to `last_voted_round` again.
+    pub fn restore(&mut self, safety: SafetyState, committed: &[Block], now: u64) -> Vec<Out> {
+        self.now = now;
+        for b in committed {
+            let h = b.hash();
+            self.history.push_back((b.round, b.voter_mask() | (1u64 << (b.author as u32 % 64))));
+            self.committed_round = b.round;
+            self.last_committed = h;
+            self.blocks.insert(h, b.clone());
+        }
+        while self.history.len() > 4 * REPUTATION_WINDOW {
+            self.history.pop_front();
+        }
+        self.last_voted_round = safety.last_voted_round;
+        self.proposed_round = safety.last_voted_round;
+        if safety.high_qc.round > self.high_qc.round {
+            self.high_qc = safety.high_qc;
+        }
+        let mut out = Vec::new();
+        let r = safety.round.max(self.high_qc.round + 1).max(1);
+        self.round = r - 1;
+        self.enter_round(r, &mut out);
+        out
+    }
+
     pub fn leader(&self, r: Round) -> NodeId {
         let n = self.validators.len();
         let cutoff = r.saturating_sub(REPUTATION_LAG);
@@ -261,6 +292,7 @@ impl Replica {
         let extends_tc = tc.as_ref().is_some_and(|t| t.round + 1 == round && qc.round >= t.high_qc.round);
         if round == self.round && round > self.last_voted_round && (extends_qc || extends_tc) {
             self.last_voted_round = round;
+            out.push(Out::Persist(self.safety_state()));
             let vote =
                 Vote { block: hash, round, voter: self.id, signature: sign(&self.key, &vote_message(&hash, round)) };
             let next = self.leader(round + 1);
@@ -361,7 +393,10 @@ impl Replica {
         let r = self.round;
         // Stop voting in this round, then (re)broadcast the timeout until the
         // round moves on, so dropped timeouts are retried.
-        self.last_voted_round = self.last_voted_round.max(r);
+        if r > self.last_voted_round {
+            self.last_voted_round = r;
+            out.push(Out::Persist(self.safety_state()));
+        }
         let t = Timeout {
             round: r,
             high_qc: self.high_qc.clone(),

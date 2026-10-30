@@ -109,3 +109,33 @@ fn reputation_routes_around_a_crashed_validator() {
         assert!(c * 2 >= honest, "crashed {crashed}: {c} vs {honest}");
     }
 }
+
+#[test]
+fn restored_replica_never_votes_twice_in_a_round() {
+    use mee_consensus::sim::key_for;
+    use mee_consensus::{Config, Message, Out, Replica, sha256};
+    let keys: Vec<_> = (0..4).map(|i| key_for(7, i)).collect();
+    let vals: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+    let genesis = sha256(&[b"g"]);
+    let mk = |i: usize| Replica::new(i as u16, keys[i].clone(), vals.clone(), genesis, Config::default());
+    // Round 1's leader proposes.
+    let mut leader = mk(1);
+    let outs = leader.start(0);
+    let proposal = outs
+        .iter()
+        .find_map(|o| if let Out::Broadcast(m @ Message::Propose { .. }) = o { Some(m.clone()) } else { None })
+        .unwrap();
+    // Replica 3 votes (to round 2's leader), persisting its safety state first.
+    let mut r3 = mk(3);
+    r3.start(0);
+    let outs = r3.on_message(1, proposal.clone(), 1);
+    let pos_persist = outs.iter().position(|o| matches!(o, Out::Persist(_))).expect("persists");
+    let pos_vote = outs.iter().position(|o| matches!(o, Out::Send(_, Message::Vote(_)))).expect("votes");
+    assert!(pos_persist < pos_vote, "safety state hits disk before the vote leaves");
+    let Out::Persist(safety) = outs[pos_persist].clone() else { unreachable!() };
+    // Crash and restore: the same proposal gets no second vote.
+    let mut back = mk(3);
+    back.restore(safety, &[], 2);
+    let outs = back.on_message(1, proposal, 3);
+    assert!(!outs.iter().any(|o| matches!(o, Out::Send(_, Message::Vote(_)))));
+}

@@ -40,10 +40,18 @@ struct Devnet {
     now: u64,
     nonces: std::collections::HashMap<[u8; 32], u64>,
     deposits: u64,
+    genesis: Genesis,
+    cfg: Config,
+    dirs: Option<Vec<std::path::PathBuf>>,
 }
 
 impl Devnet {
     fn new(crashed: Vec<usize>) -> Devnet {
+        Devnet::with_storage(crashed, None)
+    }
+
+    /// `dirs`: one data directory per validator (persistent nodes).
+    fn with_storage(crashed: Vec<usize>, dirs: Option<Vec<std::path::PathBuf>>) -> Devnet {
         let validators: Vec<SigningKey> = (0..4u8).map(|i| SigningKey::from_bytes(&[30 + i; 32])).collect();
         let genesis = Genesis {
             chain_id: CHAIN,
@@ -53,10 +61,22 @@ impl Devnet {
             launch: Default::default(),
         };
         let cfg = Config { base_timeout_ms: 200, max_timeout_ms: 2_000 };
+        let mut starts = Vec::new();
         let nodes = validators
             .iter()
             .enumerate()
-            .map(|(i, k)| Node::new(i as NodeId, k.clone(), genesis.clone(), cfg))
+            .map(|(i, k)| match &dirs {
+                Some(d) => {
+                    let (n, outs) = Node::open(&d[i], i as NodeId, k.clone(), genesis.clone(), cfg, 0).unwrap();
+                    starts.push(outs);
+                    n
+                }
+                None => {
+                    let mut n = Node::new(i as NodeId, k.clone(), genesis.clone(), cfg);
+                    starts.push(n.start(0));
+                    n
+                }
+            })
             .collect();
         let mut net = Devnet {
             nodes,
@@ -66,20 +86,38 @@ impl Devnet {
             now: 0,
             nonces: Default::default(),
             deposits: 0,
+            genesis,
+            cfg,
+            dirs,
         };
-        for i in 0..4 {
+        for (i, outs) in starts.into_iter().enumerate() {
             if !net.crashed.contains(&i) {
-                let outs = net.nodes[i].start(0);
                 net.route(i as NodeId, outs);
             }
         }
         net
     }
 
+    /// Kills validator `i` (its memory is gone).
+    fn crash(&mut self, i: usize) {
+        self.crashed.push(i);
+    }
+
+    /// Brings validator `i` back from its data directory.
+    fn restart(&mut self, i: usize) {
+        let dir = &self.dirs.as_ref().expect("persistent devnet")[i];
+        let (node, outs) =
+            Node::open(dir, i as NodeId, self.validators[i].clone(), self.genesis.clone(), self.cfg, self.now).unwrap();
+        self.nodes[i] = node;
+        self.crashed.retain(|&c| c != i);
+        self.route(i as NodeId, outs);
+    }
+
     fn route(&mut self, from: NodeId, outs: Vec<Out>) {
         // Delivered next tick: 10 ms links.
         for o in outs {
             match o {
+                Out::Persist(_) => unreachable!("the node persists and strips these"),
                 Out::Send(to, m) => self.inbox.push_back((self.now + 10, from, to, m)),
                 Out::Broadcast(m) => {
                     for to in 0..4 {
@@ -246,4 +284,38 @@ fn agree_with_one_validator_down() {
     // Leader reputation skips the dead node once 10 blocks are committed, so
     // after a short warm-up each phase needs little more than the honest case.
     scenario(vec![2], 1_500);
+}
+
+#[test]
+fn restarted_validator_recovers_from_disk_and_catches_up() {
+    let base = std::env::temp_dir().join(format!("mee-devnet-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dirs: Vec<_> = (0..4).map(|i| base.join(format!("v{i}"))).collect();
+    let mut net = Devnet::with_storage(vec![], Some(dirs));
+    let (dep, a) = (SigningKey::from_bytes(&[1; 32]), SigningKey::from_bytes(&[2; 32]));
+    net.deposit(&dep, ASSET_STAKE, 5_000);
+    net.deposit(&a, ASSET_QUOTE, 1_000_000);
+    net.run(1_000);
+    let before = net.nodes[1].app_hashes.len();
+    assert!(before > 5);
+
+    net.crash(1);
+    net.user_tx(
+        &dep,
+        Action::DeployDex { name: [0; 16], fee_share_bps: 0, stake: 1_000, oracle_authority: crypto::pubkey(&dep) },
+    );
+    net.run(2_000);
+    let progressed = net.nodes[0].app_hashes.len();
+    assert!(progressed > before + 5, "the other three keep going");
+
+    net.restart(1);
+    // Replay rebuilt everything it had committed before the crash.
+    assert!(net.nodes[1].app_hashes.len() >= before);
+    assert_eq!(net.nodes[1].app_hashes[..before], net.nodes[0].app_hashes[..before]);
+    net.run(3_000);
+    // It caught up (fetching missed blocks) and agrees at every height.
+    let heights = net.assert_agreement();
+    assert!(heights > progressed, "restarted node caught up: {heights} vs {progressed}");
+    assert_eq!(net.nodes[1].chain.state.dexes.len(), 1, "it saw the DEX deployed while it was down");
+    let _ = std::fs::remove_dir_all(&base);
 }

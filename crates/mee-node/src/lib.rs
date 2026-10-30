@@ -5,10 +5,16 @@
 //! block timestamp is clamped to be non-decreasing, and the height is the
 //! commit index, so every honest node derives the same chain blocks.
 
+pub mod storage;
+
+use std::path::Path;
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::SigningKey;
 use mee_chain::{Block, BlockOutcome, Chain, Genesis, Tx};
 use mee_consensus::{Config, Hash, Message, NodeId, Out, Replica};
+
+use crate::storage::Storage;
 
 #[derive(BorshSerialize, BorshDeserialize)]
 struct Payload {
@@ -24,6 +30,7 @@ pub struct Node {
     pub app_hashes: Vec<Hash>,
     pub outcomes: Vec<BlockOutcome>,
     max_block_txs: usize,
+    storage: Option<Storage>,
 }
 
 impl Node {
@@ -37,7 +44,54 @@ impl Node {
             app_hashes: Vec::new(),
             outcomes: Vec::new(),
             max_block_txs: 20_000,
+            storage: None,
         }
+    }
+
+    /// A node backed by `dir`. On a fresh directory this is a new node; on
+    /// an existing one it replays the committed block log into the chain and
+    /// restores consensus from the persisted safety state.
+    pub fn open(
+        dir: &Path,
+        id: NodeId,
+        key: SigningKey,
+        genesis: Genesis,
+        cfg: Config,
+        now_ms: u64,
+    ) -> std::io::Result<(Node, Vec<Out>)> {
+        let (storage, rec) = Storage::open(dir)?;
+        let mut node = Node::new(id, key, genesis, cfg);
+        for b in &rec.blocks {
+            node.apply_payload(&b.payload);
+        }
+        let outs = match rec.safety {
+            Some(safety) => node.replica.restore(safety, &rec.blocks, now_ms),
+            None if rec.blocks.is_empty() => {
+                node.refill(now_ms);
+                node.replica.start(now_ms)
+            }
+            None => node.replica.restore(node.replica.safety_state(), &rec.blocks, now_ms),
+        };
+        node.storage = Some(storage);
+        let outs = node.handle_persist(outs);
+        Ok((node, outs))
+    }
+
+    /// Persists safety state in output order and strips it from what goes on
+    /// the wire.
+    fn handle_persist(&mut self, outs: Vec<Out>) -> Vec<Out> {
+        let mut net = Vec::with_capacity(outs.len());
+        for o in outs {
+            match o {
+                Out::Persist(s) => {
+                    if let Some(st) = self.storage.as_mut() {
+                        st.save_safety(&s).expect("persist safety state before voting");
+                    }
+                }
+                other => net.push(other),
+            }
+        }
+        net
     }
 
     /// Admits a transaction to the local mempool if it passes stateless and
@@ -70,12 +124,18 @@ impl Node {
 
     fn apply_commits(&mut self) {
         for b in self.replica.drain_commits() {
-            let Ok(p) = Payload::try_from_slice(&b.payload) else {
-                // An unparsable payload is an empty block for everyone.
-                self.apply(self.chain.timestamp_ms, Vec::new());
-                continue;
-            };
-            self.apply(p.timestamp_ms.max(self.chain.timestamp_ms), p.txs);
+            if let Some(st) = self.storage.as_mut() {
+                st.append_block(&b).expect("append committed block");
+            }
+            self.apply_payload(&b.payload);
+        }
+    }
+
+    fn apply_payload(&mut self, payload: &[u8]) {
+        match Payload::try_from_slice(payload) {
+            Ok(p) => self.apply(p.timestamp_ms.max(self.chain.timestamp_ms), p.txs),
+            // An unparsable payload is an empty block for everyone.
+            Err(_) => self.apply(self.chain.timestamp_ms, Vec::new()),
         }
     }
 
@@ -88,19 +148,20 @@ impl Node {
 
     pub fn start(&mut self, now_ms: u64) -> Vec<Out> {
         self.refill(now_ms);
-        self.replica.start(now_ms)
+        let out = self.replica.start(now_ms);
+        self.handle_persist(out)
     }
 
     pub fn on_tick(&mut self, now_ms: u64) -> Vec<Out> {
         self.refill(now_ms);
         let out = self.replica.on_tick(now_ms);
         self.apply_commits();
-        out
+        self.handle_persist(out)
     }
 
     pub fn on_message(&mut self, from: NodeId, msg: Message, now_ms: u64) -> Vec<Out> {
         let out = self.replica.on_message(from, msg, now_ms);
         self.apply_commits();
-        out
+        self.handle_persist(out)
     }
 }
