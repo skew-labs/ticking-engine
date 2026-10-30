@@ -58,6 +58,7 @@ async fn launch(i: u32, validators: u32, p2p: TcpListener, peers: Vec<SocketAddr
         consensus: Config { base_timeout_ms: 300, max_timeout_ms: 3_000 },
         data_dir: None,
         peers,
+        solana: None,
     };
     mee_net::start(cfg, p2p, bind().await).await.unwrap()
 }

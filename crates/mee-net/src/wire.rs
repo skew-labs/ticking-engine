@@ -29,6 +29,8 @@ pub enum Wire {
     },
     SyncRequest(SyncRequest),
     SyncResponse(SyncResponse),
+    /// A validator's signed attestation of a Solana fact.
+    Attest(crate::observer::SignedFact),
 }
 
 #[derive(BorshSerialize, BorshDeserialize)]

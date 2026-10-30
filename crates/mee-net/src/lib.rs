@@ -18,6 +18,7 @@
 //! (consensus tolerates the drops a full queue causes).
 
 pub mod api;
+pub mod observer;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -59,6 +60,8 @@ pub struct NetConfig {
     pub data_dir: Option<PathBuf>,
     /// Addresses to dial (and keep dialing).
     pub peers: Vec<SocketAddr>,
+    /// Watch the Solana bridge and attest deposits (validators).
+    pub solana: Option<observer::SolanaConfig>,
 }
 
 type Frame = Arc<Vec<u8>>;
@@ -91,6 +94,8 @@ impl Peers {
 enum Input {
     Peer(Pubkey, Wire),
     Submit(Tx, oneshot::Sender<bool>),
+    /// An attestation this node signed.
+    Attest(observer::SignedFact),
 }
 
 /// State shared between the node task, the network and the API.
@@ -104,6 +109,8 @@ pub struct Shared {
     pub blocks: broadcast::Sender<Arc<str>>,
     /// Highest height published on `blocks`.
     pub published: AtomicU64,
+    /// Attestations of Solana facts collected from validators.
+    pub pool: Mutex<observer::Pool>,
 }
 
 impl Shared {
@@ -175,6 +182,7 @@ pub async fn start(cfg: NetConfig, p2p: TcpListener, api: TcpListener) -> std::i
         inbox,
         blocks: broadcast::channel(1024).0,
         published,
+        pool: Mutex::new(observer::Pool::default()),
     });
     let (p2p_addr, api_addr) = (p2p.local_addr()?, api.local_addr()?);
     let mut tasks = vec![
@@ -184,6 +192,9 @@ pub async fn start(cfg: NetConfig, p2p: TcpListener, api: TcpListener) -> std::i
     ];
     for addr in cfg.peers {
         tasks.push(tokio::spawn(dial_loop(shared.clone(), addr)));
+    }
+    if let Some(sol) = cfg.solana {
+        tasks.push(tokio::spawn(observe(shared.clone(), sol)));
     }
     Ok(Handle { shared, p2p_addr, api_addr, tasks })
 }
@@ -307,6 +318,14 @@ async fn run_node(shared: Arc<Shared>, mut rx: mpsc::Receiver<Input>, start_outs
                     let f = Arc::new(wire::encode(&Wire::Status { epoch, height }));
                     shared.peers.lock().unwrap().broadcast(&f, None);
                     maybe_sync(&shared, &mut sync, false);
+                    // Facts that reached a quorum (possibly after a set change).
+                    let ready = {
+                        let n = shared.node.lock().unwrap();
+                        shared.pool.lock().unwrap().refresh(&n.chain)
+                    };
+                    for tx in ready {
+                        submit_local(&shared, tx);
+                    }
                 }
             }
             input = rx.recv() => {
@@ -352,6 +371,12 @@ fn handle(shared: &Shared, sync: &mut SyncState, input: Input) {
                 shared.peers.lock().unwrap().send(&from, &f);
             }
         }
+        Input::Attest(s) => {
+            let f = Arc::new(wire::encode(&Wire::Attest(s.clone())));
+            shared.peers.lock().unwrap().broadcast(&f, None);
+            add_attestation(shared, s);
+        }
+        Input::Peer(_, Wire::Attest(s)) => add_attestation(shared, s),
         Input::Peer(_, Wire::SyncResponse(resp)) => {
             let res = shared.node.lock().unwrap().apply_sync(resp, now_ms());
             if let Ok(outs) = res {
@@ -359,6 +384,60 @@ fn handle(shared: &Shared, sync: &mut SyncState, input: Input) {
                 maybe_sync(shared, sync, true);
             }
         }
+    }
+}
+
+fn add_attestation(shared: &Shared, s: observer::SignedFact) {
+    let ready = {
+        let n = shared.node.lock().unwrap();
+        shared.pool.lock().unwrap().add(&n.chain, s)
+    };
+    if let Some(tx) = ready {
+        submit_local(shared, tx);
+    }
+}
+
+/// Admits a transaction this node built and gossips it if it was new.
+fn submit_local(shared: &Shared, tx: Tx) {
+    if shared.node.lock().unwrap().submit_tx(tx.clone()) {
+        let f = Arc::new(wire::encode(&Wire::Tx(tx)));
+        shared.peers.lock().unwrap().broadcast(&f, None);
+    }
+}
+
+/// Polls the Solana bridge for deposit records past the chain's next
+/// expected id and attests them while this node is a validator. Pending
+/// attestations are re-sent every poll until the chain has them, so peers
+/// that connect late still get them.
+async fn observe(shared: Arc<Shared>, cfg: observer::SolanaConfig) {
+    let rpc = observer::Rpc::new(&cfg.rpc_url);
+    let me = shared.me();
+    loop {
+        let (next, bridge, is_validator) = {
+            let n = shared.node.lock().unwrap();
+            (n.chain.next_deposit_id, n.chain.bridge_program, n.chain.validators.contains(&me))
+        };
+        if is_validator {
+            for id in next..next + observer::LOOKAHEAD {
+                let fact = match observer::read_deposit(&rpc, &bridge, id).await {
+                    Ok(Some(f)) => f,
+                    Ok(None) => break, // ids are sequential
+                    Err(e) => {
+                        eprintln!("observer: {e}");
+                        break;
+                    }
+                };
+                let msg = {
+                    let n = shared.node.lock().unwrap();
+                    fact.message(&n.chain)
+                };
+                let s = observer::SignedFact { fact, validator: me, signature: shared.sign(&msg) };
+                if shared.inbox.send(Input::Attest(s)).await.is_err() {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(cfg.poll).await;
     }
 }
 

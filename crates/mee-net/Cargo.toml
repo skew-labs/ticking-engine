@@ -16,6 +16,11 @@ mee-consensus = { path = "../mee-consensus" }
 mee-core = { path = "../mee-core" }
 mee-engine = { path = "../mee-engine" }
 mee-node = { path = "../mee-node" }
+mee = { path = "../../programs/mee", features = ["no-entrypoint"] }
+base64 = "0.22"
+bs58 = "0.5"
+bytemuck.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = { version = "0.8", features = ["ws"] }
 borsh.workspace = true
 ed25519-dalek.workspace = true

@@ -15,6 +15,10 @@ pub mod processor;
 pub mod state;
 pub mod token;
 
+/// Re-exported so off-chain users (validators, relayers) derive PDAs with the
+/// same types.
+pub use solana_program;
+
 solana_program::declare_id!("2WB9JqZNgVQdtoQhQPNxZ8GiURJqcBwwKayGq7tttLii");
 
 #[cfg(not(feature = "no-entrypoint"))]

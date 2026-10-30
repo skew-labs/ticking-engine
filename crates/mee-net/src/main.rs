@@ -42,6 +42,7 @@ async fn main() -> std::io::Result<()> {
         consensus: Config { base_timeout_ms: 500, max_timeout_ms: 5_000 },
         data_dir: data.map(|d| std::path::Path::new(&d).join(format!("node{index}"))),
         peers: (0..nodes).filter(|&j| j != index).map(|j| local(p2p_base + j as u16)).collect(),
+        solana: None,
     };
     let handle = mee_net::start(cfg, p2p, api).await?;
     eprintln!(
