@@ -153,6 +153,9 @@ fn pending_funding(m: &Market, p: &Position) -> Result<i128> {
         return Ok(0);
     }
     let delta = math::sub(m.cum_funding, p.last_funding)?;
+    if delta == 0 {
+        return Ok(0);
+    }
     Ok(math::div_ceil(math::mul(p.base as i128, delta)?, FUNDING_SCALE))
 }
 

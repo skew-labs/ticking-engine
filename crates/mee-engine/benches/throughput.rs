@@ -1,6 +1,8 @@
 //! Single-thread throughput on a market-making style flow:
 //! 60% passive limit orders around mid, 30% cancels, 10% crossing IOCs.
-//! Every operation runs the full checks (margin, OI, fees, funding).
+//! Every operation runs the full checks (margin, OI, fees, funding), and the
+//! state is committed (account Merkle tree, book digests, roots) every
+//! `BLOCK` operations (default 5,000), as a chain block would.
 //!
 //! `cargo bench -p mee-engine`
 
@@ -70,10 +72,15 @@ fn main() {
 
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     let mut live: Vec<(AccountId, OrderId)> = Vec::new();
-    let n_ops = 2_000_000u64;
+    let n_ops: u64 = std::env::var("OPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
     let (mut places, mut cancels, mut takes, mut fills, mut errors) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let block: u64 = std::env::var("BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(5_000);
+    s.commit();
     let start = Instant::now();
-    for _ in 0..n_ops {
+    for op in 0..n_ops {
+        if op % block == 0 {
+            s.commit();
+        }
         let a = accounts[rng.below(n_accounts as u64) as usize];
         let roll = rng.below(100);
         let mid = 100_000u64;
@@ -127,6 +134,7 @@ fn main() {
             ev.clear();
         }
     }
+    s.commit();
     let elapsed = start.elapsed();
     fills += ev.iter().filter(|e| matches!(e, Event::Fill { .. })).count() as u64;
     let rate = n_ops as f64 / elapsed.as_secs_f64();

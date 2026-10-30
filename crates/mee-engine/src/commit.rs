@@ -50,12 +50,40 @@ impl MultisetHash {
         }
     }
 
+    /// Adds another multiset's sum (e.g. a `Delta`) into this one.
+    pub fn merge(&mut self, d: &Delta) {
+        self.add(&d.plus.bytes());
+        self.sub(&d.minus.bytes());
+    }
+
     pub fn bytes(&self) -> Hash {
         let mut out = [0u8; 32];
         for (i, l) in self.0.iter().enumerate() {
             out[i * 8..i * 8 + 8].copy_from_slice(&l.to_le_bytes());
         }
         out
+    }
+}
+
+/// Pending change to a multiset hash: sums of added and removed elements.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Delta {
+    plus: MultisetHash,
+    minus: MultisetHash,
+}
+
+impl Delta {
+    pub fn add(&mut self, h: &Hash) {
+        self.plus.add(h);
+    }
+
+    pub fn sub(&mut self, h: &Hash) {
+        self.minus.add(h);
+    }
+
+    pub fn merge(&mut self, other: &Delta) {
+        self.plus.add(&other.plus.bytes());
+        self.minus.add(&other.minus.bytes());
     }
 }
 
@@ -265,6 +293,9 @@ impl State {
     /// Rehashes accounts touched since the last commit and every market and
     /// DEX (few, and each is a fixed-size digest), then returns the roots.
     pub fn commit(&mut self) -> StateRoots {
+        for m in &mut self.markets {
+            m.book.flush_digest();
+        }
         let dirty = self.accounts.take_dirty();
         let changes: Vec<(usize, Hash)> =
             dirty.into_iter().map(|i| (i as usize, account_leaf(i, &self.accounts[i as usize]))).collect();
