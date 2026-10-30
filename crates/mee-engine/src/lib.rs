@@ -9,6 +9,7 @@
 pub mod book;
 pub mod commit;
 pub mod engine;
+pub mod snapshot;
 pub mod state;
 
 pub use engine::{CancelReason, Event, Events, OrderRequest, PlaceOutcome};

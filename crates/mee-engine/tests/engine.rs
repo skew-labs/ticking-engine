@@ -585,3 +585,63 @@ fn modify_keeps_priority_when_shrinking_and_restores_on_failure() {
     assert_eq!(e.pos(a).base, -4);
     assert_eq!(e.pos(b).base, -2);
 }
+
+#[test]
+fn snapshot_round_trips_and_rejects_tampering() {
+    let mut e = Env::new();
+    let (a, b, c) = (e.trader(1, 100_000), e.trader(2, 100_000), e.trader(3, 1_000_000));
+    e.order(a, Side::Ask, OrderKind::Limit, PRICE + 10, 5).unwrap();
+    e.order(b, Side::Ask, OrderKind::Limit, PRICE + 10, 5).unwrap();
+    e.order(c, Side::Bid, OrderKind::Limit, PRICE - 10, 7).unwrap();
+    e.order(c, Side::Bid, OrderKind::ImmediateOrCancel, PRICE + 10, 6).unwrap();
+    let roots = e.s.commit();
+    let bytes = e.s.to_snapshot();
+    let mut back = State::from_snapshot(&bytes).unwrap();
+    assert_eq!(back.last_roots, roots);
+    assert_eq!(back.to_snapshot(), bytes, "byte-identical round trip");
+
+    // Both copies keep evolving identically (book priority survived).
+    let mut ev2 = Vec::new();
+    let req = OrderRequest {
+        market: e.m,
+        side: Side::Bid,
+        kind: OrderKind::ImmediateOrCancel,
+        price: PRICE + 10,
+        size: 3,
+        reduce_only: false,
+        client_id: 0,
+    };
+    e.s.place_order(c, &req, &mut e.ev).unwrap();
+    back.place_order(c, &req, &mut ev2).unwrap();
+    assert_eq!(e.ev.last(), ev2.last());
+    assert_eq!(e.s.commit(), back.commit());
+
+    // Any flipped byte is caught (bad encoding or a different root).
+    for at in [bytes.len() / 3, bytes.len() / 2, bytes.len() - 40] {
+        let mut bad = bytes.clone();
+        bad[at] ^= 1;
+        assert!(State::from_snapshot(&bad).is_err(), "tampered byte {at} accepted");
+    }
+}
+
+#[test]
+fn every_snapshot_byte_is_committed_except_genesis_params() {
+    let mut e = Env::new();
+    let (a, b, c) = (e.trader(1, 100_000), e.trader(2, 100_000), e.trader(3, 1_000_000));
+    e.order(a, Side::Ask, OrderKind::Limit, PRICE + 10, 5).unwrap();
+    e.order(b, Side::Ask, OrderKind::Limit, PRICE + 10, 5).unwrap();
+    e.order(c, Side::Bid, OrderKind::Limit, PRICE - 10, 7).unwrap();
+    e.order(c, Side::Bid, OrderKind::ImmediateOrCancel, PRICE + 10, 6).unwrap();
+    e.s.commit();
+    let bytes = e.s.to_snapshot();
+    let params = 4..4 + std::mem::size_of::<EngineParams>();
+    for at in 0..bytes.len() {
+        let mut bad = bytes.clone();
+        bad[at] ^= 1;
+        // Never panics on bad input; only the params (checked against genesis
+        // by the chain) may change without breaking the root.
+        if State::from_snapshot(&bad).is_ok() {
+            assert!(params.contains(&at), "byte {at} is not covered by the state root");
+        }
+    }
+}

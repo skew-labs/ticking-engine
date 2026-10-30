@@ -11,7 +11,7 @@ pub type OrderId = u64;
 
 /// One market's position. Same cash-flow model as `mee-core`: unrealized PnL
 /// is `base * mark + quote`, and `quote` moves to collateral when flat.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct Position {
     pub base: i64,
     pub quote: i128,
@@ -28,7 +28,7 @@ impl Position {
 
 /// An account's cross-margin sub-account inside one perp DEX. DEXes are
 /// isolated from each other, like HIP-3.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct Margin {
     pub collateral: i64,
     /// Sorted by market id; small, so a vec beats a map.
@@ -55,7 +55,7 @@ impl Margin {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct Account {
     pub owner: Key,
     /// Free quote balance (bridged USDC), outside any DEX.
@@ -109,7 +109,7 @@ pub struct Market {
     pub book: Book,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct Dex {
     pub id: DexId,
     pub name: [u8; 16],

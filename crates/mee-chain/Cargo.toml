@@ -10,6 +10,7 @@ publish.workspace = true
 mee-core = { path = "../mee-core" }
 mee-engine = { path = "../mee-engine" }
 borsh.workspace = true
+bytemuck.workspace = true
 ed25519-dalek.workspace = true
 rustc-hash.workspace = true
 sha2.workspace = true

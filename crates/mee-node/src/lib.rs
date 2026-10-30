@@ -75,6 +75,21 @@ pub const MAX_MEMPOOL: usize = 200_000;
 pub const MAX_PENDING_PER_SENDER: usize = 64;
 /// How far past an account's nonce a pending transaction may be.
 pub const MAX_NONCE_AHEAD: u64 = 64;
+/// Heights between snapshots by default.
+pub const DEFAULT_SNAPSHOT_EVERY: u64 = 10_000;
+/// Block outcomes kept in memory.
+pub const OUTCOME_RETENTION: usize = 100_000;
+
+/// What a node writes as its snapshot: the chain state and the app hash of
+/// every height up to it. Stored as `sha256(body) ‖ body`, so disk corruption
+/// anywhere (including the app-hash history, which no state root covers) is
+/// detected.
+#[derive(BorshSerialize, BorshDeserialize)]
+struct NodeSnapshot {
+    height: u64,
+    chain: Vec<u8>,
+    app_hashes: Vec<Hash>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetOut {
@@ -101,7 +116,14 @@ pub struct Node {
     future: Vec<Envelope>,
     /// App hash after each applied height (index = height - 1).
     pub app_hashes: Vec<Hash>,
+    /// Outcomes of recent heights (from `first_outcome`), for the API and
+    /// subscribers; older ones are dropped.
     pub outcomes: Vec<BlockOutcome>,
+    pub first_outcome: u64,
+    /// Write a snapshot after every this many heights (0 = never).
+    pub snapshot_every: u64,
+    /// Height of the snapshot this node was restored from, if any.
+    pub restored_from: Option<u64>,
     max_block_txs: usize,
     storage: Option<Storage>,
     /// Every applied consensus block with its epoch (index = height - 1).
@@ -155,6 +177,9 @@ impl Node {
             future: Vec::new(),
             app_hashes: Vec::new(),
             outcomes: Vec::new(),
+            first_outcome: 1,
+            snapshot_every: DEFAULT_SNAPSHOT_EVERY,
+            restored_from: None,
             max_block_txs: 20_000,
             storage: None,
             committed: Vec::new(),
@@ -175,9 +200,30 @@ impl Node {
         now_ms: u64,
     ) -> std::io::Result<(Node, Vec<NetOut>)> {
         let (storage, rec) = Storage::open(dir)?;
-        let mut node = Node::new(key, genesis, cfg);
-        for (e, b) in &rec.blocks {
+        let mut node = Node::new(key, genesis.clone(), cfg);
+        // Resume from the snapshot if it is sound and the log reaches it;
+        // otherwise replay everything.
+        let body = rec.snapshot.as_deref().filter(|b| b.len() > 32 && crypto::sha256(&[&b[32..]])[..] == b[..32]);
+        if let Some(snap) = body.and_then(|b| NodeSnapshot::try_from_slice(&b[32..]).ok())
+            && snap.height as usize <= rec.blocks.len()
+            && snap.app_hashes.len() as u64 == snap.height
+            && let Ok(chain) = Chain::from_snapshot(&genesis, &snap.chain)
+            && chain.height == snap.height
+            && snap.app_hashes.last().is_none_or(|h| *h == chain.app_hash)
+        {
+            node.chain = chain;
+            node.app_hashes = snap.app_hashes;
+            node.first_outcome = snap.height + 1;
+            node.epoch = node.chain.epoch;
+            node.epoch_genesis = consensus_genesis(&node.chain);
+            node.restored_from = Some(snap.height);
+        }
+        let skip = node.chain.height as usize;
+        for (i, (e, b)) in rec.blocks.iter().enumerate() {
             node.committed.push((*e, b.clone()));
+            if i < skip {
+                continue;
+            }
             node.apply_payload(&b.payload);
             if node.chain.epoch != node.epoch {
                 node.epoch = node.chain.epoch;
@@ -300,6 +346,28 @@ impl Node {
         }
         self.apply_payload(&b.payload);
         self.committed.push((self.epoch, b));
+        if self.snapshot_every > 0 && self.chain.height.is_multiple_of(self.snapshot_every) {
+            self.write_snapshot();
+        }
+    }
+
+    /// Snapshot of the current height (the block log already holds it).
+    fn write_snapshot(&mut self) {
+        let Some(st) = self.storage.as_mut() else { return };
+        let snap = NodeSnapshot {
+            height: self.chain.height,
+            chain: self.chain.to_snapshot(),
+            app_hashes: self.app_hashes.clone(),
+        };
+        let body = borsh::to_vec(&snap).expect("borsh");
+        let mut file = crypto::sha256(&[&body]).to_vec();
+        file.extend_from_slice(&body);
+        st.save_snapshot(&file).expect("write snapshot");
+    }
+
+    /// Outcome of a committed height, while it is retained.
+    pub fn outcome(&self, height: u64) -> Option<&BlockOutcome> {
+        self.outcomes.get(height.checked_sub(self.first_outcome)? as usize)
     }
 
     /// Starts the consensus instance of the chain's (new) epoch and replays
@@ -332,6 +400,10 @@ impl Node {
         let out = self.chain.apply_block(&block).expect("height and time are derived locally");
         self.app_hashes.push(out.app_hash);
         self.outcomes.push(out);
+        if self.outcomes.len() >= 2 * OUTCOME_RETENTION {
+            self.outcomes.drain(..OUTCOME_RETENTION);
+            self.first_outcome += OUTCOME_RETENTION as u64;
+        }
     }
 
     pub fn height(&self) -> u64 {

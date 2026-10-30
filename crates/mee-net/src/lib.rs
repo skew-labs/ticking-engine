@@ -501,7 +501,7 @@ fn publish(shared: &Shared) {
         return;
     }
     for h in from + 1..=to {
-        if let Some(out) = node.outcomes.get(h as usize - 1) {
+        if let Some(out) = node.outcome(h) {
             let _ = shared.blocks.send(api::block_json(h, out).to_string().into());
         }
     }

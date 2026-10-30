@@ -230,7 +230,7 @@ pub struct Chain {
     /// Stake burned by slashing.
     pub slashed_validator_stake: u64,
     /// Set while applying a block that slashed someone (forces an election).
-    slashed_in_block: bool,
+    pub(crate) slashed_in_block: bool,
     pub triggers: std::collections::BTreeMap<u64, Trigger>,
     pub next_trigger_id: u64,
     /// Voting weight of each validator (same order as `validators`): its
@@ -735,6 +735,14 @@ impl Chain {
             buf.extend_from_slice(k);
         }
         buf.extend_from_slice(&self.slashed_validator_stake.to_le_bytes());
+        buf.extend_from_slice(b"epochs");
+        for (e, (genesis, members)) in &self.epochs {
+            buf.extend_from_slice(&e.to_le_bytes());
+            buf.extend_from_slice(genesis);
+            for m in members {
+                buf.extend_from_slice(m);
+            }
+        }
         buf.extend_from_slice(b"triggers");
         buf.extend_from_slice(&self.next_trigger_id.to_le_bytes());
         for (id, t) in &self.triggers {

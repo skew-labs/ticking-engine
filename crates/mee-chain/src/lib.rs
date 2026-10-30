@@ -8,6 +8,7 @@
 
 pub mod chain;
 pub mod crypto;
+pub mod snapshot;
 pub mod tx;
 
 pub use chain::{

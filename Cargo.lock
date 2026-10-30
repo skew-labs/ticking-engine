@@ -3253,6 +3253,7 @@ name = "mee-chain"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "bytemuck",
  "ed25519-dalek 2.2.0",
  "mee-core",
  "mee-engine",
@@ -3281,6 +3282,8 @@ dependencies = [
 name = "mee-engine"
 version = "0.1.0"
 dependencies = [
+ "borsh",
+ "bytemuck",
  "mee-core",
  "rustc-hash",
  "sha2 0.10.9",

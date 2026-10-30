@@ -529,3 +529,69 @@ fn stop_loss_fires_on_the_mark_and_batches_report_partial_failure() {
     let t = net.tx(&a, nested);
     assert_eq!(net.block(vec![t]).results, vec![Err(TxError::BadAction)]);
 }
+
+#[test]
+fn snapshot_restores_a_chain_that_continues_identically() {
+    let (mut net, _dep, a, b) = setup();
+    let txs = vec![net.tx(&b, order(0, 1, 1, PRICE, 10)), net.tx(&a, order(0, 0, 2, PRICE, 4))];
+    net.ok(txs);
+    let stop = Action::PlaceTrigger {
+        market: 0,
+        side: 1,
+        above: false,
+        trigger_price: PRICE - 200,
+        limit_price: PRICE - 400,
+        size: 4,
+        reduce_only: true,
+    };
+    let w = Action::Withdraw { asset: ASSET_QUOTE, amount: 1, destination: [8; 32] };
+    let txs = vec![
+        net.tx(&a, stop),
+        net.tx(&b, Action::TransferFromDex { dex: 0, amount: 10 }),
+        net.tx(&b, w),
+        net.tx(&b, order(0, 0, 0, PRICE - 50, 3)),
+    ];
+    net.ok(txs);
+    let bytes = net.chain.to_snapshot();
+    let genesis = Genesis {
+        chain_id: CHAIN,
+        params: params(),
+        validators: net.validators.iter().map(crypto::pubkey).collect(),
+        timestamp_ms: 0,
+        launch: Default::default(),
+        staking: Default::default(),
+        bridge_program: [0; 32],
+    };
+    let mut back = Chain::from_snapshot(&genesis, &bytes).unwrap();
+    assert_eq!(
+        (back.height, back.state_root, back.app_hash),
+        (net.chain.height, net.chain.state_root, net.chain.app_hash)
+    );
+    assert_eq!(back.to_snapshot(), bytes);
+
+    // The same next block gives the same result on both.
+    let next = Block {
+        height: net.chain.height + 1,
+        timestamp_ms: net.ts + 1_000,
+        txs: vec![net.tx(&a, order(0, 1, 2, PRICE - 50, 2)), net.tx(&b, Action::CancelAll { market: 0 })],
+    };
+    let o1 = net.chain.apply_block(&next).unwrap();
+    let o2 = back.apply_block(&next).unwrap();
+    assert_eq!((o1.app_hash, o1.state_root), (o2.app_hash, o2.state_root));
+
+    // Another network's genesis or a flipped byte is refused.
+    let other = Genesis { chain_id: CHAIN + 1, ..genesis.clone() };
+    assert_eq!(Chain::from_snapshot(&other, &bytes).err(), Some(mee_chain::snapshot::SnapshotError::WrongGenesis));
+    // Every byte but the app hash (a running hash of history, not a function
+    // of the state, so it can't be recomputed) is checked: engine params
+    // against the genesis, the rest through hash chains and the state root.
+    let app_hash = Chain::from_snapshot(&genesis, &bytes).unwrap().app_hash;
+    let at_hash = bytes.windows(32).position(|w| w == app_hash).unwrap();
+    for at in 0..bytes.len() {
+        let mut bad = bytes.clone();
+        bad[at] ^= 1;
+        if Chain::from_snapshot(&genesis, &bad).is_ok() {
+            assert!((at_hash..at_hash + 32).contains(&at), "tampered byte {at} accepted");
+        }
+    }
+}

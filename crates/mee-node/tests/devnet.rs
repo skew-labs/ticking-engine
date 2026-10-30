@@ -543,3 +543,44 @@ fn double_voting_validator_is_caught_slashed_and_ejected() {
     net.run(1_000);
     assert!(net.assert_agreement() > before + 5, "the remaining three keep going");
 }
+
+#[test]
+fn restart_resumes_from_snapshot_and_falls_back_if_it_is_corrupt() {
+    let (base, dirs) = temp_dirs("snapshot", 4);
+    let mut net = Devnet::build(4, 4, vec![], Some(dirs.clone()), Staking::default());
+    for n in &mut net.nodes {
+        n.snapshot_every = 25;
+    }
+    let (dep, a) = (SigningKey::from_bytes(&[1; 32]), SigningKey::from_bytes(&[2; 32]));
+    net.deposit(&dep, ASSET_STAKE, 5_000);
+    net.deposit(&a, ASSET_QUOTE, 1_000_000);
+    net.run(500);
+    net.user_tx(
+        &dep,
+        Action::DeployDex { name: [0; 16], fee_share_bps: 0, stake: 1_000, oracle_authority: crypto::pubkey(&dep) },
+    );
+    net.run(1_000);
+
+    net.crash(2);
+    net.run(300);
+    net.restart(2);
+    let from = net.nodes[2].restored_from.expect("resumed from the snapshot");
+    assert!(from >= 25 && from.is_multiple_of(25), "snapshot height {from}");
+    assert_eq!(net.nodes[2].chain.state.dexes.len(), 1);
+    net.run(1_500);
+    let heights = net.assert_agreement();
+    assert!(heights as u64 > from + 10);
+
+    // A damaged snapshot is detected and ignored: full replay instead.
+    net.crash(2);
+    let path = dirs[2].join("snapshot.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x40;
+    std::fs::write(&path, bytes).unwrap();
+    net.restart(2);
+    assert_eq!(net.nodes[2].restored_from, None, "corrupt snapshot refused");
+    net.run(1_000);
+    net.assert_agreement();
+    let _ = std::fs::remove_dir_all(&base);
+}

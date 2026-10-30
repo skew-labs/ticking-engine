@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 mee-core = { path = "../mee-core" }
+borsh.workspace = true
+bytemuck.workspace = true
 rustc-hash.workspace = true
 sha2.workspace = true
 

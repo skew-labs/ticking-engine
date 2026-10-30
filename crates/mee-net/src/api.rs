@@ -323,7 +323,7 @@ async fn withdrawal(State(s): S, Path(id): Path<u64>) -> Response {
 async fn state_root(State(s): S, Path(height): Path<u64>) -> Response {
     let roots = {
         let n = s.node.lock().unwrap();
-        height.checked_sub(1).and_then(|i| n.outcomes.get(i as usize)).map(|o| (o.state_root, o.app_hash))
+        n.outcome(height).map(|o| (o.state_root, o.app_hash))
     };
     let Some((state_root, app_hash)) = roots else {
         return err(StatusCode::NOT_FOUND, "height not committed here");

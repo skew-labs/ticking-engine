@@ -1,6 +1,7 @@
 //! Durable node storage: the consensus safety state (replaced atomically and
-//! fsynced before any vote leaves the node) and an append-only log of
-//! committed blocks from which the chain state is rebuilt on restart.
+//! fsynced before any vote leaves the node), an append-only log of committed
+//! blocks, and the latest state snapshot (replaced atomically) so a restart
+//! only replays the blocks after it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -19,6 +20,8 @@ pub struct Recovered {
     pub safety: Option<(u64, SafetyState)>,
     /// (epoch, block) in commit order.
     pub blocks: Vec<(u64, Block)>,
+    /// Latest snapshot bytes, if any.
+    pub snapshot: Option<Vec<u8>>,
 }
 
 impl Storage {
@@ -49,17 +52,31 @@ impl Storage {
         }
         let log = OpenOptions::new().create(true).append(true).open(&path)?;
         log.set_len(good)?;
-        Ok((Storage { dir: dir.to_path_buf(), log }, Recovered { safety, blocks }))
+        let snapshot = match fs::read(dir.join("snapshot.bin")) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        Ok((Storage { dir: dir.to_path_buf(), log }, Recovered { safety, blocks, snapshot }))
     }
 
     /// Replaces the safety state: write a temp file, fsync, rename, fsync the
     /// directory. Either the old or the new state survives a crash.
     pub fn save_safety(&mut self, epoch: u64, s: &SafetyState) -> io::Result<()> {
-        let tmp = self.dir.join("safety.tmp");
+        self.replace("safety", &borsh::to_vec(&(epoch, s)).map_err(io::Error::other)?)
+    }
+
+    /// Replaces the snapshot (same crash-safe replace as the safety state).
+    pub fn save_snapshot(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.replace("snapshot", bytes)
+    }
+
+    fn replace(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let tmp = self.dir.join(format!("{name}.tmp"));
         let mut f = File::create(&tmp)?;
-        f.write_all(&borsh::to_vec(&(epoch, s)).map_err(io::Error::other)?)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
-        fs::rename(&tmp, self.dir.join("safety.bin"))?;
+        fs::rename(&tmp, self.dir.join(format!("{name}.bin")))?;
         File::open(&self.dir)?.sync_all()
     }
 
