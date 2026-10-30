@@ -500,6 +500,19 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
             crate::bridge::withdraw(program_id, it, id, asset, destination, amount)
         }
         MeeInstruction::RotateValidators { validators } => crate::bridge::rotate(program_id, it, &validators),
+        MeeInstruction::InitLaunchpad { params } => crate::launchpad::init(program_id, it, params),
+        MeeInstruction::CreateLaunch { name, symbol } => crate::launchpad::create(program_id, it, name, symbol),
+        MeeInstruction::LaunchBuy { quote_in, min_tokens_out } => {
+            crate::launchpad::buy(program_id, it, quote_in, min_tokens_out)
+        }
+        MeeInstruction::LaunchSell { tokens_in, min_quote_out } => {
+            crate::launchpad::sell(program_id, it, tokens_in, min_quote_out)
+        }
+        MeeInstruction::Graduate => crate::launchpad::graduate(program_id, it),
+        MeeInstruction::PoolSwap { quote_to_token, amount_in, min_out } => {
+            crate::launchpad::swap(program_id, it, quote_to_token, amount_in, min_out)
+        }
+        MeeInstruction::ClaimCreatorFees => crate::launchpad::claim_creator_fees(program_id, it),
     }
 }
 

@@ -17,6 +17,7 @@ pub enum MeeError {
     InvalidSystemProgram = 1008,
     BookMismatch = 1009,
     TooManyGuardians = 1010,
+    SlippageExceeded = 1011,
 }
 
 impl From<MeeError> for ProgramError {

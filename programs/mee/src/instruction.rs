@@ -169,6 +169,24 @@ pub enum MeeInstruction {
     BridgeWithdraw { id: u64, asset: u8, destination: [u8; 32], amount: u64 },
     /// [bridge (w), instructions_sysvar]
     RotateValidators { validators: Vec<[u8; 32]> },
+
+    // --- launchpad (see `launchpad`) ---------------------------------------------
+    /// [admin (s,w), config (w), quote_mint, treasury, system_program, rent]
+    InitLaunchpad { params: crate::launchpad::LaunchParams },
+    /// [creator (s,w), config (w), launch (w), mint (w), token_vault (w), quote_vault (w),
+    ///  quote_mint, authority, token_program, system_program, rent, clock]
+    CreateLaunch { name: [u8; 32], symbol: [u8; 16] },
+    /// Trade accounts: [user (s), config, launch (w), token_vault (w), quote_vault (w),
+    ///  user_token (w), user_quote (w), treasury (w), authority, token_program, clock]
+    LaunchBuy { quote_in: u64, min_tokens_out: u64 },
+    /// Trade accounts, as `LaunchBuy`.
+    LaunchSell { tokens_in: u64, min_quote_out: u64 },
+    /// [launch (w), clock]
+    Graduate,
+    /// Trade accounts, as `LaunchBuy`.
+    PoolSwap { quote_to_token: bool, amount_in: u64, min_out: u64 },
+    /// [creator (s), launch (w), quote_vault (w), creator_quote (w), authority, token_program]
+    ClaimCreatorFees,
 }
 
 fn ix(program_id: &Pubkey, data: MeeInstruction, accounts: Vec<AccountMeta>) -> Instruction {

@@ -9,6 +9,7 @@
 pub mod bridge;
 pub mod error;
 pub mod instruction;
+pub mod launchpad;
 pub mod pda;
 pub mod processor;
 pub mod state;
