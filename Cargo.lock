@@ -3158,6 +3158,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mee-consensus"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "rustc-hash",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "mee-core"
 version = "0.1.0"
 dependencies = [

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mee-core", "crates/mee-engine", "crates/mee-chain", "programs/mee"]
+members = ["crates/mee-core", "crates/mee-engine", "crates/mee-chain", "crates/mee-consensus", "programs/mee"]
 
 [workspace.package]
 edition = "2024"
@@ -19,3 +19,11 @@ sha2 = "0.10"
 overflow-checks = true
 lto = "fat"
 codegen-units = 1
+
+# Crypto is unbearably slow unoptimized; keep debug test runs quick.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
