@@ -145,14 +145,14 @@ pub fn run(cfg: &SimConfig) -> SimResult {
                 push: &mut dyn FnMut(&mut Queue, &mut Slab, u64, Ev)| {
         for o in outs {
             let targets: Vec<(NodeId, Message)> = match o {
-                Out::Persist(_) => continue,
+                Out::Persist(_) | Out::Evidence(_) => continue,
                 Out::Send(to, m) => vec![(to, m)],
                 Out::Broadcast(m) => {
                     let alt = match (&m, cfg.equivocator) {
                         (Message::Propose { block, tc }, Some(e)) if e == from => {
                             let mut b2 = block.clone();
                             b2.payload = [block.payload.clone(), b"-equivocated".to_vec()].concat();
-                            b2.signature = sign(&keys[from as usize], &proposal_message(&b2.hash()));
+                            b2.signature = sign(&keys[from as usize], &proposal_message(&genesis, &b2.hash()));
                             Some(Message::Propose { block: b2, tc: tc.clone() })
                         }
                         _ => None,

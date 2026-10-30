@@ -407,3 +407,53 @@ fn staking_elects_the_validator_set_each_epoch() {
     net.ok(vec![]); // height 9
     assert_eq!(net.chain.state.accounts[a as usize].stake_balance, 1_000, "unbonded after the next election");
 }
+
+#[test]
+fn double_votes_slash_the_validator_and_its_delegators() {
+    let mut net = Net::new();
+    let delegator = key(7);
+    let bad = &net.validators[2].clone();
+    let bad_key = crypto::pubkey(bad);
+    let dep = net.deposit_tx(&delegator, ASSET_STAKE, 10_000);
+    let dep2 = net.deposit_tx(bad, ASSET_QUOTE, 1);
+    net.ok(vec![dep, dep2]);
+    let d = net.tx(&delegator, Action::Delegate { validator: bad_key, amount: 6_000 });
+    let u = net.tx(&delegator, Action::Undelegate { validator: bad_key, amount: 2_000 });
+    net.ok(vec![d, u]); // 4_000 bonded, 2_000 unbonding
+
+    let domain = net.chain.consensus_genesis();
+    let vote = |b: [u8; 32], round: u64| crypto::sign(bad, &crypto::consensus_vote_message(&domain, &b, round));
+    let evidence = |block_b: [u8; 32], sig_b| {
+        Tx::System(SystemTx::Evidence {
+            epoch: 0,
+            validator: bad_key,
+            round: 9,
+            block_a: [1; 32],
+            sig_a: vote([1; 32], 9),
+            block_b,
+            sig_b,
+        })
+    };
+    // The same vote twice, or a signature for another round, proves nothing.
+    assert_eq!(net.chain.check_tx(&evidence([1; 32], vote([1; 32], 9))), Err(TxError::BadEvidence));
+    assert_eq!(net.chain.check_tx(&evidence([2; 32], vote([2; 32], 10))), Err(TxError::BadEvidence));
+
+    let out = net.ok(vec![evidence([2; 32], vote([2; 32], 9))]);
+    // Ejected immediately (a forced election), not at some later epoch.
+    let (epoch, set) = out.validator_set.expect("set changed");
+    assert_eq!(epoch, 1);
+    assert!(!set.iter().any(|(k, _)| *k == bad_key));
+    assert_eq!(set.len(), 3);
+    let a = net.chain.state.account_id(&crypto::pubkey(&delegator)).unwrap();
+    // 5% of the bonded 4_000 and of the unbonding 2_000.
+    assert_eq!(net.chain.delegations[&(a, bad_key)], 3_800);
+    assert_eq!(net.chain.unbonding[0].4, 1_900);
+    assert_eq!(net.chain.slashed_validator_stake, 300);
+    assert!(net.chain.tombstoned.contains(&bad_key));
+
+    // Once is enough; the key can't come back.
+    let again = evidence([3; 32], vote([3; 32], 9));
+    assert_eq!(net.block(vec![again]).results, vec![Err(TxError::AlreadySlashed)]);
+    let r = net.tx(bad, Action::RegisterValidator);
+    assert_eq!(net.block(vec![r]).results, vec![Err(TxError::AlreadySlashed)]);
+}

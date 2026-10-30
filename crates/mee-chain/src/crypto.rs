@@ -97,6 +97,23 @@ pub fn valset_message(chain_id: u64, nonce: u64, validators: &[(Pubkey, u64)]) -
     sha256(&parts)
 }
 
+/// Genesis hash of the consensus instance that runs epoch `epoch`
+/// (`app_hash` = the chain's app hash right after the block that started it).
+/// Every consensus signature carries it, which ties votes to one epoch.
+pub fn consensus_genesis(chain_id: u64, epoch: u64, app_hash: &Hash) -> Hash {
+    if epoch == 0 {
+        sha256(&[b"MEE/consensus-genesis", &chain_id.to_le_bytes()])
+    } else {
+        sha256(&[b"MEE/epoch-genesis", &chain_id.to_le_bytes(), &epoch.to_le_bytes(), app_hash])
+    }
+}
+
+/// A consensus vote as validators sign it. Must match
+/// `mee_consensus::vote_message` byte for byte.
+pub fn consensus_vote_message(domain: &Hash, block: &Hash, round: u64) -> Hash {
+    sha256(&[b"MEE/vote", domain, block, &round.to_le_bytes()])
+}
+
 /// More than two thirds of `total` weight.
 pub fn is_quorum(weight: u128, total: u128) -> bool {
     3 * weight > 2 * total

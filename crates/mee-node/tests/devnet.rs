@@ -507,3 +507,38 @@ fn mempool_bounds_pending_transactions_per_sender() {
     let other = Tx::User(SignedTx::sign(&a, CHAIN, 1, Action::Withdraw { asset: 0, amount: 2, destination: [0; 32] }));
     assert!(!node.submit_tx(other), "per-sender cap");
 }
+
+#[test]
+fn double_voting_validator_is_caught_slashed_and_ejected() {
+    let mut net = Devnet::new(vec![]);
+    net.run(500);
+    let domain = net.nodes[0].chain.consensus_genesis();
+    assert_eq!(
+        crypto::consensus_vote_message(&domain, &[5; 32], 3),
+        mee_consensus::vote_message(&domain, &[5; 32], 3),
+        "chain and consensus agree on the signed vote bytes"
+    );
+    // Validator 3 signs votes for two different blocks in an upcoming round;
+    // whoever leads the next round sees both.
+    let round = net.nodes.iter().map(|n| n.replica.round).max().unwrap() + 2;
+    let bad = net.keys[3].clone();
+    for block in [[0xAA; 32], [0xBB; 32]] {
+        let signature = crypto::sign(&bad, &mee_consensus::vote_message(&domain, &block, round));
+        let v = mee_consensus::Vote { block, round, voter: 3, signature };
+        let env = Envelope { epoch: 0, from: crypto::pubkey(&bad), msg: mee_consensus::Message::Vote(v) };
+        for i in 0..3 {
+            net.inbox.push_back((net.now + 10, i, env.clone()));
+        }
+    }
+    net.run(3_000);
+    let bad_key = crypto::pubkey(&bad);
+    for n in &net.nodes {
+        assert!(n.chain.tombstoned.contains(&bad_key), "slashed everywhere");
+        assert_eq!(n.epoch, 1, "ejected through an immediate election");
+        assert!(!n.chain.validators.contains(&bad_key));
+    }
+    assert!(!net.nodes[3].replica.is_validator());
+    let before = net.assert_agreement();
+    net.run(1_000);
+    assert!(net.assert_agreement() > before + 5, "the remaining three keep going");
+}

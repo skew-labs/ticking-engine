@@ -93,6 +93,8 @@ pub struct Node {
     /// (tx hash, tx); `in_pool` dedups gossip.
     mempool: Vec<(Hash, Tx)>,
     in_pool: std::collections::HashSet<Hash>,
+    /// Transactions this node created itself (evidence), to be gossiped.
+    local_txs: Vec<Tx>,
     /// Pending user transactions per signer.
     per_sender: std::collections::HashMap<Pubkey, usize>,
     /// Messages for a future epoch, replayed once we switch.
@@ -115,17 +117,10 @@ pub fn tx_hash(tx: &Tx) -> Hash {
     crypto::sha256(&[&borsh::to_vec(tx).expect("borsh")])
 }
 
+/// Recorded by the chain when the epoch starts (see
+/// `mee_chain::crypto::consensus_genesis`).
 fn consensus_genesis(chain: &Chain) -> Hash {
-    if chain.epoch == 0 {
-        crypto::sha256(&[b"MEE/consensus-genesis", &chain.chain_id.to_le_bytes()])
-    } else {
-        crypto::sha256(&[
-            b"MEE/epoch-genesis",
-            &chain.chain_id.to_le_bytes(),
-            &chain.epoch.to_le_bytes(),
-            &chain.app_hash,
-        ])
-    }
+    chain.consensus_genesis()
 }
 
 fn committee(chain: &Chain) -> Committee {
@@ -156,6 +151,7 @@ impl Node {
             mempool: Vec::new(),
             in_pool: Default::default(),
             per_sender: Default::default(),
+            local_txs: Vec::new(),
             future: Vec::new(),
             app_hashes: Vec::new(),
             outcomes: Vec::new(),
@@ -225,6 +221,11 @@ impl Node {
         true
     }
 
+    /// Transactions this node generated since the last call (for gossip).
+    pub fn take_local_txs(&mut self) -> Vec<Tx> {
+        std::mem::take(&mut self.local_txs)
+    }
+
     /// Transactions waiting locally.
     pub fn mempool(&self) -> impl Iterator<Item = &Tx> {
         self.mempool.iter().map(|(_, tx)| tx)
@@ -251,6 +252,7 @@ impl Node {
                 Tx::System(mee_chain::SystemTx::LaunchOracle { solana_slot, .. }) => {
                     *solana_slot > chain.last_oracle_slot
                 }
+                Tx::System(mee_chain::SystemTx::Evidence { validator, .. }) => !chain.tombstoned.contains(validator),
             };
             if !keep {
                 in_pool.remove(id);
@@ -443,6 +445,24 @@ impl Node {
                     }
                 }
                 Out::Broadcast(msg) => net.push(NetOut::Broadcast(Envelope { epoch, from: self.me, msg })),
+                Out::Evidence(e) => {
+                    // Queue the slashing proof; it rides our next proposal
+                    // (or anyone's, once gossiped).
+                    if let Some(validator) = validators.get(e.voter as usize) {
+                        let tx = Tx::System(mee_chain::SystemTx::Evidence {
+                            epoch,
+                            validator: *validator,
+                            round: e.round,
+                            block_a: e.a.0,
+                            sig_a: e.a.1,
+                            block_b: e.b.0,
+                            sig_b: e.b.1,
+                        });
+                        if self.submit_tx(tx.clone()) {
+                            self.local_txs.push(tx);
+                        }
+                    }
+                }
                 Out::Send(to, msg) => {
                     let dest = validators.get(to as usize).copied().or(sender);
                     if let Some(d) = dest {

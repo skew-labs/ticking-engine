@@ -84,16 +84,20 @@ impl Committee {
     }
 }
 
-pub fn vote_message(block: &Hash, round: Round) -> Hash {
-    sha256(&[b"MEE/vote", block, &round.to_le_bytes()])
+/// Signed consensus messages carry the instance's genesis hash (one per
+/// epoch), so a signature from one epoch or chain never counts in another and
+/// two votes for the same round of the same instance are proof of
+/// equivocation.
+pub fn vote_message(domain: &Hash, block: &Hash, round: Round) -> Hash {
+    sha256(&[b"MEE/vote", domain, block, &round.to_le_bytes()])
 }
 
-pub fn timeout_message(round: Round, high_qc_round: Round) -> Hash {
-    sha256(&[b"MEE/timeout", &round.to_le_bytes(), &high_qc_round.to_le_bytes()])
+pub fn timeout_message(domain: &Hash, round: Round, high_qc_round: Round) -> Hash {
+    sha256(&[b"MEE/timeout", domain, &round.to_le_bytes(), &high_qc_round.to_le_bytes()])
 }
 
-pub fn proposal_message(block: &Hash) -> Hash {
-    sha256(&[b"MEE/propose", block])
+pub fn proposal_message(domain: &Hash, block: &Hash) -> Hash {
+    sha256(&[b"MEE/propose", domain, block])
 }
 
 /// Quorum certificate: 2f+1 votes for `block` in `round`. The genesis QC
@@ -187,6 +191,17 @@ pub enum Out {
     /// it in the same output batch (it guards against double voting after a
     /// restart).
     Persist(SafetyState),
+    /// Proof that `voter` signed votes for two different blocks in one
+    /// round (the chain slashes it).
+    Evidence(Equivocation),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Equivocation {
+    pub voter: NodeId,
+    pub round: Round,
+    pub a: (Hash, Sig),
+    pub b: (Hash, Sig),
 }
 
 /// What a replica must remember across restarts to stay safe.

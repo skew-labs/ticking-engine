@@ -388,6 +388,13 @@ fn maybe_sync(shared: &Shared, sync: &mut SyncState, progressed: bool) {
 }
 
 fn dispatch(shared: &Shared, outs: Vec<NetOut>) {
+    let local = shared.node.lock().unwrap().take_local_txs();
+    if !local.is_empty() {
+        let peers = shared.peers.lock().unwrap();
+        for tx in local {
+            peers.broadcast(&Arc::new(wire::encode(&Wire::Tx(tx))), None);
+        }
+    }
     if outs.is_empty() {
         return;
     }

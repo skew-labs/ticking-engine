@@ -216,6 +216,11 @@ pub enum SystemTx {
     /// Pool TWAPs and depths observed at Solana slot `solana_slot` (strictly
     /// increasing, so an old batch can't be replayed).
     LaunchOracle { solana_slot: u64, updates: Vec<LaunchObservation>, attestations: Vec<Attestation> },
+    /// Two votes by `validator` for different blocks in the same round of
+    /// epoch `epoch`'s consensus. Self-proving: anyone may submit it. The
+    /// validator's stake (its delegations, including unbonding ones) is cut
+    /// by `EQUIVOCATION_SLASH_BPS` and the key is barred for good.
+    Evidence { epoch: u64, validator: Pubkey, round: u64, block_a: Hash, sig_a: Sig, block_b: Hash, sig_b: Sig },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

@@ -19,6 +19,10 @@ pub struct Genesis {
     pub staking: Staking,
 }
 
+/// Share of a double-signing validator's stake (and its delegators') that is
+/// burned.
+pub const EQUIVOCATION_SLASH_BPS: u64 = 500;
+
 /// Validator staking. `epoch_blocks == 0` keeps the genesis set forever.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Staking {
@@ -105,6 +109,9 @@ pub enum TxError {
     /// Oracle batch from a Solana slot not after the last one.
     StaleOracle,
     InsufficientStake,
+    /// Equivocation evidence that doesn't check out.
+    BadEvidence,
+    AlreadySlashed,
     Engine(EngineError),
 }
 
@@ -186,7 +193,16 @@ pub struct Chain {
     pub delegations: std::collections::BTreeMap<(AccountId, Pubkey), u64>,
     /// (ready at unix seconds, requested at height, account, amount), in
     /// request order.
-    pub unbonding: Vec<(i64, u64, AccountId, u64)>,
+    pub unbonding: Vec<(i64, u64, AccountId, Pubkey, u64)>,
+    /// Consensus genesis and member keys of every epoch so far (evidence is
+    /// checked against them).
+    pub epochs: std::collections::BTreeMap<u64, (Hash, Vec<Pubkey>)>,
+    /// Validators slashed for equivocation; they can never register again.
+    pub tombstoned: std::collections::BTreeSet<Pubkey>,
+    /// Stake burned by slashing.
+    pub slashed_validator_stake: u64,
+    /// Set while applying a block that slashed someone (forces an election).
+    slashed_in_block: bool,
     /// Voting weight of each validator (same order as `validators`): its
     /// stake at the election, or the genesis weight.
     pub validator_weights: Vec<u64>,
@@ -222,6 +238,10 @@ impl Chain {
             stakes: g.validators.iter().map(|v| (*v, g.staking.min_validator_stake)).collect(),
             delegations: Default::default(),
             unbonding: Vec::new(),
+            epochs: [(0, (crypto::consensus_genesis(g.chain_id, 0, &[0; 32]), g.validators.clone()))].into(),
+            tombstoned: Default::default(),
+            slashed_validator_stake: 0,
+            slashed_in_block: false,
             validator_weights: vec![g.staking.min_validator_stake.max(1); g.validators.len()],
             registered: g.validators.iter().copied().collect(),
         }
@@ -235,6 +255,11 @@ impl Chain {
     /// The current set as (key, weight), in set order.
     pub fn committee(&self) -> Vec<(Pubkey, u64)> {
         self.validators.iter().copied().zip(self.validator_weights.iter().copied()).collect()
+    }
+
+    /// Genesis hash of the current epoch's consensus instance.
+    pub fn consensus_genesis(&self) -> Hash {
+        self.epochs[&self.epoch].0
     }
 
     /// Mempool admission: signature and nonce, no execution.
@@ -278,6 +303,18 @@ impl Chain {
                 let msg =
                     crypto::launch_oracle_message(self.chain_id, *solana_slot, &borsh::to_vec(updates).expect("borsh"));
                 self.check_quorum(&msg, attestations)
+            }
+            Tx::System(SystemTx::Evidence { epoch, validator, round, block_a, sig_a, block_b, sig_b }) => {
+                let Some((domain, members)) = self.epochs.get(epoch) else { return Err(TxError::BadEvidence) };
+                let signed = |b: &Hash, s: &crypto::Sig| {
+                    crypto::verify(validator, &crypto::consensus_vote_message(domain, b, *round), s)
+                };
+                if block_a != block_b && members.contains(validator) && signed(block_a, sig_a) && signed(block_b, sig_b)
+                {
+                    Ok(())
+                } else {
+                    Err(TxError::BadEvidence)
+                }
             }
         }
     }
@@ -372,7 +409,10 @@ impl Chain {
             out.results.push(r);
         }
         let e = self.staking.epoch_blocks;
-        if e > 0 && self.height.is_multiple_of(e) {
+        // A slashed validator leaves the set right away, not at the next
+        // scheduled election.
+        let slashed = std::mem::take(&mut self.slashed_in_block);
+        if (e > 0 && self.height.is_multiple_of(e)) || slashed {
             let next = self.elect();
             let mut current = self.committee();
             current.sort();
@@ -401,6 +441,10 @@ impl Chain {
         }
         self.app_hash = h;
         out.app_hash = h;
+        if out.validator_set.is_some() {
+            let genesis = crypto::consensus_genesis(self.chain_id, self.epoch, &self.app_hash);
+            self.epochs.insert(self.epoch, (genesis, self.validators.clone()));
+        }
         Ok(out)
     }
 
@@ -502,6 +546,14 @@ impl Chain {
                 self.last_oracle_slot = *solana_slot;
                 Ok(())
             }
+            Tx::System(SystemTx::Evidence { validator, .. }) => {
+                // The signatures were checked in `verify_tx`.
+                if self.tombstoned.contains(validator) {
+                    return Err(TxError::AlreadySlashed);
+                }
+                self.slash_validator(validator);
+                Ok(())
+            }
             Tx::User(t) => {
                 // A valid signature with a fresh nonce consumes the nonce even
                 // if the action fails, so it can never be replayed.
@@ -535,6 +587,40 @@ impl Chain {
         }
     }
 
+    /// Burns `EQUIVOCATION_SLASH_BPS` of everything delegated to `v`
+    /// (unbonding included: leaving doesn't dodge the penalty) and bars the
+    /// key for good.
+    fn slash_validator(&mut self, v: &Pubkey) {
+        let cut = |x: u64| (x as u128 * EQUIVOCATION_SLASH_BPS as u128).div_ceil(10_000) as u64;
+        let mut burned = 0u64;
+        let mut from_stake = 0u64;
+        for ((_, k), d) in self.delegations.iter_mut() {
+            if k == v {
+                let c = cut(*d);
+                *d -= c;
+                from_stake += c;
+            }
+        }
+        self.delegations.retain(|_, d| *d > 0);
+        for u in self.unbonding.iter_mut() {
+            if u.3 == *v {
+                let c = cut(u.4);
+                u.4 -= c;
+                burned += c;
+            }
+        }
+        if let Some(s) = self.stakes.get_mut(v) {
+            *s = s.saturating_sub(from_stake);
+            if *s == 0 {
+                self.stakes.remove(v);
+            }
+        }
+        self.slashed_validator_stake = self.slashed_validator_stake.saturating_add(burned + from_stake);
+        self.registered.remove(v);
+        self.tombstoned.insert(*v);
+        self.slashed_in_block = true;
+    }
+
     fn release_unbonded(&mut self) {
         let now = self.timestamp_ms / 1_000;
         let (e, height) = (self.staking.epoch_blocks, self.height);
@@ -544,7 +630,7 @@ impl Chain {
         let (ready, wait): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.unbonding).into_iter().partition(|u| u.0 <= now && past_election(u.1));
         self.unbonding = wait;
-        for (_, _, a, amount) in ready {
+        for (_, _, a, _, amount) in ready {
             let acct = &mut self.state.accounts[a as usize];
             acct.stake_balance = acct.stake_balance.saturating_add(amount);
         }
@@ -561,12 +647,18 @@ impl Chain {
             buf.extend_from_slice(k);
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        for (t, h, a, v) in &self.unbonding {
+        for (t, h, a, k, v) in &self.unbonding {
             buf.extend_from_slice(&t.to_le_bytes());
             buf.extend_from_slice(&h.to_le_bytes());
             buf.extend_from_slice(&a.to_le_bytes());
+            buf.extend_from_slice(k);
             buf.extend_from_slice(&v.to_le_bytes());
         }
+        buf.extend_from_slice(b"tombstoned");
+        for k in &self.tombstoned {
+            buf.extend_from_slice(k);
+        }
+        buf.extend_from_slice(&self.slashed_validator_stake.to_le_bytes());
         for (v, w) in self.validators.iter().zip(&self.validator_weights) {
             buf.extend_from_slice(v);
             buf.extend_from_slice(&w.to_le_bytes());
@@ -735,10 +827,14 @@ impl Chain {
                 if *s == 0 {
                     self.stakes.remove(validator);
                 }
-                self.unbonding.push((self.timestamp_ms / 1_000 + self.staking.unbond_secs, self.height, a, *amount));
+                let ready = self.timestamp_ms / 1_000 + self.staking.unbond_secs;
+                self.unbonding.push((ready, self.height, a, *validator, *amount));
                 Ok(())
             }
             Action::RegisterValidator => {
+                if self.tombstoned.contains(signer) {
+                    return Err(TxError::AlreadySlashed);
+                }
                 self.registered.insert(*signer);
                 Ok(())
             }

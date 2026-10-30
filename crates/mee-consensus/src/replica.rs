@@ -35,7 +35,7 @@ pub fn qc_is_valid(committee: &Committee, genesis: &Hash, qc: &Qc) -> bool {
     if qc.round == 0 {
         return qc.block == *genesis && qc.votes.is_empty();
     }
-    let msg = vote_message(&qc.block, qc.round);
+    let msg = vote_message(genesis, &qc.block, qc.round);
     let valid =
         qc.votes.iter().filter(|(v, sig)| committee.keys.get(*v as usize).is_some_and(|k| verify(k, &msg, sig)));
     committee.is_quorum(committee.weight_of(valid.map(|(v, _)| *v)))
@@ -99,6 +99,8 @@ pub fn verify_committed_segment(
 
 pub const REPUTATION_WINDOW: usize = 10;
 pub const REPUTATION_LAG: u64 = 3;
+/// Rounds back in which double votes are still detected.
+pub const EVIDENCE_WINDOW: u64 = 64;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Config {
@@ -127,6 +129,9 @@ pub struct Replica {
     deadline: u64,
     consecutive_timeouts: u32,
     votes: FxHashMap<(Hash, Round), Vec<(NodeId, Sig)>>,
+    /// First vote seen from each validator per recent round (directly or
+    /// inside a QC), to catch double votes.
+    seen_votes: FxHashMap<(Round, NodeId), (Hash, Sig)>,
     timeouts: FxHashMap<Round, Vec<Timeout>>,
     pub committed_round: Round,
     last_committed: Hash,
@@ -165,6 +170,7 @@ impl Replica {
             deadline: 0,
             consecutive_timeouts: 0,
             votes: FxHashMap::default(),
+            seen_votes: FxHashMap::default(),
             timeouts: FxHashMap::default(),
             committed_round: 0,
             last_committed: genesis,
@@ -327,7 +333,12 @@ impl Replica {
         let mut max_hqc = 0;
         let mut valid = Vec::new();
         for (v, hqr, sig) in &tc.timeouts {
-            if self.validators.keys.get(*v as usize).is_some_and(|k| verify(k, &timeout_message(tc.round, *hqr), sig)) {
+            if self
+                .validators
+                .keys
+                .get(*v as usize)
+                .is_some_and(|k| verify(k, &timeout_message(&self.genesis, tc.round, *hqr), sig))
+            {
                 valid.push(*v);
                 max_hqc = max_hqc.max(*hqr);
             }
@@ -340,7 +351,11 @@ impl Replica {
     fn valid_block(&self, b: &Block) -> bool {
         b.author == self.leader(b.round)
             && b.qc.round < b.round
-            && verify(&self.validators.keys[b.author as usize], &proposal_message(&b.hash()), &b.signature)
+            && verify(
+                &self.validators.keys[b.author as usize],
+                &proposal_message(&self.genesis, &b.hash()),
+                &b.signature,
+            )
             && self.valid_qc(&b.qc)
     }
 
@@ -380,8 +395,12 @@ impl Replica {
             self.last_voted_round = round;
             self.voted.push(hash);
             out.push(Out::Persist(self.safety_state()));
-            let vote =
-                Vote { block: hash, round, voter: self.id, signature: sign(&self.key, &vote_message(&hash, round)) };
+            let vote = Vote {
+                block: hash,
+                round,
+                voter: self.id,
+                signature: sign(&self.key, &vote_message(&self.genesis, &hash, round)),
+            };
             let next = self.leader(round + 1);
             if next == self.id {
                 self.on_vote(vote, out);
@@ -401,7 +420,41 @@ impl Replica {
         self.try_commit(&hqc, out);
     }
 
+    /// Remembers a verified vote; a different block for the same round and
+    /// voter is equivocation.
+    fn witness_vote(&mut self, voter: NodeId, round: Round, block: Hash, sig: Sig, out: &mut Vec<Out>) {
+        if voter as usize >= self.validators.len() || round + EVIDENCE_WINDOW < self.round {
+            return;
+        }
+        match self.seen_votes.get(&(round, voter)) {
+            None => {
+                self.seen_votes.insert((round, voter), (block, sig));
+            }
+            Some(&(first, first_sig)) if first != block => {
+                // QC entries are recorded unverified (the QC as a whole was
+                // checked); check both signatures before accusing anyone.
+                let key = &self.validators.keys[voter as usize];
+                let ok = |b: &Hash, sg: &Sig| verify(key, &vote_message(&self.genesis, b, round), sg);
+                match (ok(&first, &first_sig), ok(&block, &sig)) {
+                    (true, true) => {
+                        out.push(Out::Evidence(Equivocation { voter, round, a: (first, first_sig), b: (block, sig) }))
+                    }
+                    (false, true) => {
+                        self.seen_votes.insert((round, voter), (block, sig));
+                    }
+                    _ => {}
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
     fn process_qc(&mut self, qc: Qc, out: &mut Vec<Out>) {
+        if qc.round > 0 {
+            for (v, sig) in &qc.votes {
+                self.witness_vote(*v, qc.round, qc.block, *sig, out);
+            }
+        }
         if qc.round > self.high_qc.round {
             self.high_qc = qc.clone();
         }
@@ -433,6 +486,7 @@ impl Replica {
         let backoff = self.cfg.base_timeout_ms.saturating_mul(1u64 << self.consecutive_timeouts.min(16));
         self.deadline = self.now + backoff.min(self.cfg.max_timeout_ms);
         self.votes.retain(|(_, round), _| *round + 2 >= r);
+        self.seen_votes.retain(|(round, _), _| *round + EVIDENCE_WINDOW >= r);
         self.timeouts.retain(|round, _| *round + 2 >= r);
         if self.leader(r) == self.id && self.high_qc.round + 1 == r {
             self.propose(None, out);
@@ -447,7 +501,7 @@ impl Replica {
         let payload = self.mempool.pop_front().unwrap_or_default();
         let mut block =
             Block { round: self.round, author: self.id, qc: self.high_qc.clone(), payload, signature: [0; 64] };
-        block.signature = sign(&self.key, &proposal_message(&block.hash()));
+        block.signature = sign(&self.key, &proposal_message(&self.genesis, &block.hash()));
         out.push(Out::Broadcast(Message::Propose { block: block.clone(), tc: tc.clone() }));
         self.on_proposal(self.id, block, tc, out);
     }
@@ -458,10 +512,11 @@ impl Replica {
             || !self.is_validator()
             || self.leader(v.round + 1) != self.id
             || v.round + 1 < self.round
-            || !verify(&self.validators.keys[i], &vote_message(&v.block, v.round), &v.signature)
+            || !verify(&self.validators.keys[i], &vote_message(&self.genesis, &v.block, v.round), &v.signature)
         {
             return;
         }
+        self.witness_vote(v.voter, v.round, v.block, v.signature, out);
         let entry = self.votes.entry((v.block, v.round)).or_default();
         if entry.iter().any(|(who, _)| *who == v.voter) {
             return;
@@ -494,7 +549,7 @@ impl Replica {
             round: r,
             high_qc: self.high_qc.clone(),
             voter: self.id,
-            signature: sign(&self.key, &timeout_message(r, self.high_qc.round)),
+            signature: sign(&self.key, &timeout_message(&self.genesis, r, self.high_qc.round)),
         };
         self.timeout_sent_at = Some((r, self.now));
         let backoff = self.cfg.base_timeout_ms.saturating_mul(1u64 << self.consecutive_timeouts.min(16));
@@ -506,7 +561,11 @@ impl Replica {
     fn on_timeout(&mut self, t: Timeout, out: &mut Vec<Out>) {
         let i = t.voter as usize;
         if i >= self.validators.len()
-            || !verify(&self.validators.keys[i], &timeout_message(t.round, t.high_qc.round), &t.signature)
+            || !verify(
+                &self.validators.keys[i],
+                &timeout_message(&self.genesis, t.round, t.high_qc.round),
+                &t.signature,
+            )
             || !self.valid_qc(&t.high_qc)
         {
             return;
