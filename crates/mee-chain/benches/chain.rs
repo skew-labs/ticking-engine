@@ -34,6 +34,7 @@ fn main() {
         validators: validators.iter().map(crypto::pubkey).collect(),
         timestamp_ms: 0,
         launch: Default::default(),
+        staking: Default::default(),
     });
     let traders: Vec<SigningKey> = (0..2_000u32)
         .map(|i| {

@@ -204,6 +204,7 @@ async fn graduated_token_gets_a_perp() {
         validators: vals.0.iter().map(crypto::pubkey).collect(),
         timestamp_ms: 0,
         launch: Default::default(),
+        staking: Default::default(),
     });
     let mut height = 0;
     let mut block = |c: &mut chain::Chain, txs: Vec<Tx>| {

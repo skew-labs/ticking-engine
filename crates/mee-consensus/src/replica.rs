@@ -130,6 +130,17 @@ impl Replica {
         out
     }
 
+    /// A replica that follows commits (from proposals and their QCs) without
+    /// voting, proposing or timing out: full nodes and validators-in-waiting.
+    pub fn observer(validators: Vec<Pubkey>, genesis: Hash, cfg: Config) -> Replica {
+        // Any key works: an observer never signs.
+        Replica::new(NodeId::MAX, SigningKey::from_bytes(&[0; 32]), validators, genesis, cfg)
+    }
+
+    pub fn is_validator(&self) -> bool {
+        (self.id as usize) < self.validators.len()
+    }
+
     pub fn leader(&self, r: Round) -> NodeId {
         let n = self.validators.len();
         let cutoff = r.saturating_sub(REPUTATION_LAG);
@@ -290,7 +301,7 @@ impl Replica {
 
         let extends_qc = qc.round + 1 == round;
         let extends_tc = tc.as_ref().is_some_and(|t| t.round + 1 == round && qc.round >= t.high_qc.round);
-        if round == self.round && round > self.last_voted_round && (extends_qc || extends_tc) {
+        if self.is_validator() && round == self.round && round > self.last_voted_round && (extends_qc || extends_tc) {
             self.last_voted_round = round;
             out.push(Out::Persist(self.safety_state()));
             let vote =
@@ -353,7 +364,7 @@ impl Replica {
     }
 
     fn propose(&mut self, tc: Option<Tc>, out: &mut Vec<Out>) {
-        if self.proposed_round >= self.round {
+        if !self.is_validator() || self.proposed_round >= self.round {
             return;
         }
         self.proposed_round = self.round;
@@ -368,6 +379,7 @@ impl Replica {
     fn on_vote(&mut self, v: Vote, out: &mut Vec<Out>) {
         let i = v.voter as usize;
         if i >= self.validators.len()
+            || !self.is_validator()
             || self.leader(v.round + 1) != self.id
             || v.round + 1 < self.round
             || !verify(&self.validators[i], &vote_message(&v.block, v.round), &v.signature)
@@ -390,6 +402,9 @@ impl Replica {
     }
 
     fn local_timeout(&mut self, out: &mut Vec<Out>) {
+        if !self.is_validator() {
+            return;
+        }
         let r = self.round;
         // Stop voting in this round, then (re)broadcast the timeout until the
         // round moves on, so dropped timeouts are retried.

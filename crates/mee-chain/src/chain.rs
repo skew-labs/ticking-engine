@@ -16,6 +16,26 @@ pub struct Genesis {
     pub validators: Vec<Pubkey>,
     pub timestamp_ms: i64,
     pub launch: LaunchMarkets,
+    pub staking: Staking,
+}
+
+/// Validator staking. `epoch_blocks == 0` keeps the genesis set forever.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Staking {
+    /// The set is recomputed after every block whose height is a multiple
+    /// of this.
+    pub epoch_blocks: u64,
+    pub max_validators: usize,
+    /// Below this total delegation a key can't be a validator.
+    pub min_validator_stake: u64,
+    /// Seconds an undelegation waits before the stake is free again.
+    pub unbond_secs: i64,
+}
+
+impl Default for Staking {
+    fn default() -> Self {
+        Staking { epoch_blocks: 0, max_validators: 16, min_validator_stake: 1, unbond_secs: 7 * 24 * 3_600 }
+    }
 }
 
 /// Risk template for perps of graduated launchpad tokens. Conservative by
@@ -84,6 +104,7 @@ pub enum TxError {
     AlreadyListed,
     /// Oracle batch from a Solana slot not after the last one.
     StaleOracle,
+    InsufficientStake,
     Engine(EngineError),
 }
 
@@ -125,6 +146,10 @@ pub struct BlockOutcome {
     pub withdrawals: Vec<WithdrawalReceipt>,
     /// State root after this block; validators sign it for light clients.
     pub state_root: Hash,
+    /// Set when this block ended an epoch with a new validator set: (new
+    /// epoch, new set). The old set signs `crypto::valset_message` for the
+    /// Solana bridge.
+    pub validator_set: Option<(u64, Vec<Pubkey>)>,
     pub app_hash: Hash,
 }
 
@@ -152,6 +177,15 @@ pub struct Chain {
     /// Launch id → perp listing. Lookup only.
     pub listings: FxHashMap<u64, Listing>,
     pub last_oracle_slot: u64,
+    pub staking: Staking,
+    /// Bumped whenever the validator set changes.
+    pub epoch: u64,
+    /// Total delegated stake per validator key (genesis validators start
+    /// with `min_validator_stake` of virtual, non-withdrawable stake).
+    pub stakes: std::collections::BTreeMap<Pubkey, u64>,
+    pub delegations: std::collections::BTreeMap<(AccountId, Pubkey), u64>,
+    /// (ready at unix seconds, account, amount), in request order.
+    pub unbonding: Vec<(i64, AccountId, u64)>,
 }
 
 impl Chain {
@@ -160,7 +194,7 @@ impl Chain {
         state.now = g.timestamp_ms / 1_000;
         Chain {
             chain_id: g.chain_id,
-            validators: g.validators,
+            validators: g.validators.clone(),
             state,
             height: 0,
             timestamp_ms: g.timestamp_ms,
@@ -176,6 +210,11 @@ impl Chain {
             launch_dex: None,
             listings: FxHashMap::default(),
             last_oracle_slot: 0,
+            staking: g.staking,
+            epoch: 0,
+            stakes: g.validators.iter().map(|v| (*v, g.staking.min_validator_stake)).collect(),
+            delegations: Default::default(),
+            unbonding: Vec::new(),
         }
     }
 
@@ -307,10 +346,23 @@ impl Chain {
         order.sort_by_key(|&i| block.txs[i].priority()); // stable: keeps proposer order within a class
 
         let _ = self.state.begin_block(block.timestamp_ms / 1_000, &mut out.events);
+        self.release_unbonded();
         for i in order {
             let tx = &block.txs[i];
             let r = verified[i].and_then(|_| self.check_nonce(tx)).and_then(|_| self.execute(tx, &mut out));
             out.results.push(r);
+        }
+        let e = self.staking.epoch_blocks;
+        if e > 0 && self.height.is_multiple_of(e) {
+            let next = self.elect();
+            let mut current = self.validators.clone();
+            current.sort();
+            // Same members in another order is not a change.
+            if next != current {
+                self.validators = next.clone();
+                self.epoch += 1;
+                out.validator_set = Some((self.epoch, next));
+            }
         }
 
         let roots = self.state.commit();
@@ -440,9 +492,53 @@ impl Chain {
         }
     }
 
+    /// Top `max_validators` keys by stake (ties by key), each with at least
+    /// `min_validator_stake`, in key order.
+    pub fn elect(&self) -> Vec<Pubkey> {
+        let mut c: Vec<(&Pubkey, &u64)> =
+            self.stakes.iter().filter(|(_, s)| **s >= self.staking.min_validator_stake).collect();
+        c.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let mut set: Vec<Pubkey> = c.into_iter().take(self.staking.max_validators).map(|(k, _)| *k).collect();
+        set.sort();
+        if set.is_empty() { self.validators.clone() } else { set }
+    }
+
+    fn release_unbonded(&mut self) {
+        let now = self.timestamp_ms / 1_000;
+        let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.unbonding).into_iter().partition(|u| u.0 <= now);
+        self.unbonding = wait;
+        for (_, a, amount) in ready {
+            let acct = &mut self.state.accounts[a as usize];
+            acct.stake_balance = acct.stake_balance.saturating_add(amount);
+        }
+    }
+
+    fn staking_hash(&self) -> Hash {
+        let mut buf = Vec::new();
+        for (k, v) in &self.stakes {
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for ((a, k), v) in &self.delegations {
+            buf.extend_from_slice(&a.to_le_bytes());
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for (t, a, v) in &self.unbonding {
+            buf.extend_from_slice(&t.to_le_bytes());
+            buf.extend_from_slice(&a.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &self.validators {
+            buf.extend_from_slice(v);
+        }
+        crypto::sha256(&[b"MEE/staking", &self.epoch.to_le_bytes(), &buf])
+    }
+
     /// Chain-level values outside the engine state.
     pub fn globals_hash(&self) -> Hash {
         crypto::sha256(&[
+            &self.staking_hash(),
             b"MEE/chain-globals",
             &self.height.to_le_bytes(),
             &self.timestamp_ms.to_le_bytes(),
@@ -570,6 +666,35 @@ impl Chain {
                 self.state.claim_deployer_fees(a, *dex).map(|_| ())
             }
             Action::SweepProtocolFees { dex } => self.state.sweep_protocol_fees(*dex).map(|_| ()),
+            Action::Delegate { validator, amount } => {
+                let a = self.account(signer)?;
+                let acct = &mut self.state.accounts[a as usize];
+                if *amount == 0 || acct.stake_balance < *amount {
+                    return Err(TxError::InsufficientStake);
+                }
+                acct.stake_balance -= amount;
+                *self.stakes.entry(*validator).or_insert(0) += amount;
+                *self.delegations.entry((a, *validator)).or_insert(0) += amount;
+                Ok(())
+            }
+            Action::Undelegate { validator, amount } => {
+                let a = self.account(signer)?;
+                let d = self.delegations.get_mut(&(a, *validator)).ok_or(TxError::InsufficientStake)?;
+                if *amount == 0 || *d < *amount {
+                    return Err(TxError::InsufficientStake);
+                }
+                *d -= amount;
+                if *d == 0 {
+                    self.delegations.remove(&(a, *validator));
+                }
+                let s = self.stakes.get_mut(validator).expect("delegated stake is counted");
+                *s -= amount;
+                if *s == 0 {
+                    self.stakes.remove(validator);
+                }
+                self.unbonding.push((self.timestamp_ms / 1_000 + self.staking.unbond_secs, a, *amount));
+                Ok(())
+            }
         };
         r.map_err(TxError::from)
     }

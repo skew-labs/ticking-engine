@@ -1,17 +1,19 @@
-//! Four validators, each with its own chain state, agree on blocks through
-//! BFT consensus; bridged deposits, a HIP-3 deployment and order flow go
-//! through it. Every node must reach the same app hash at every height,
-//! including with one validator crashed.
+//! Validators (and observers), each with its own chain state, agree on
+//! blocks through BFT consensus over a simulated 10 ms network. Bridged
+//! deposits, a HIP-3 deployment, order flow, crashes, restarts from disk and
+//! validator-set changes go through it; every node must reach the same app
+//! hash at every height.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use ed25519_dalek::SigningKey;
 use mee_chain::crypto;
 use mee_chain::*;
-use mee_consensus::{Config, Message, NodeId, Out};
+use mee_consensus::Config;
 use mee_core::EngineParams;
 use mee_engine::Event;
-use mee_node::Node;
+use mee_node::{Envelope, NetOut, Node};
 
 const CHAIN: u64 = 77;
 
@@ -33,54 +35,57 @@ fn params() -> EngineParams {
 }
 
 struct Devnet {
+    /// Physical nodes; the first `genesis validators` are validators at
+    /// genesis, the rest start as observers.
     nodes: Vec<Node>,
-    validators: Vec<SigningKey>,
+    keys: Vec<SigningKey>,
     crashed: Vec<usize>,
-    inbox: VecDeque<(u64, NodeId, NodeId, Message)>,
+    inbox: VecDeque<(u64, usize, Envelope)>,
     now: u64,
     nonces: std::collections::HashMap<[u8; 32], u64>,
     deposits: u64,
     genesis: Genesis,
     cfg: Config,
-    dirs: Option<Vec<std::path::PathBuf>>,
+    dirs: Option<Vec<PathBuf>>,
 }
 
 impl Devnet {
     fn new(crashed: Vec<usize>) -> Devnet {
-        Devnet::with_storage(crashed, None)
+        Devnet::build(4, 4, crashed, None, Staking::default())
     }
 
-    /// `dirs`: one data directory per validator (persistent nodes).
-    fn with_storage(crashed: Vec<usize>, dirs: Option<Vec<std::path::PathBuf>>) -> Devnet {
-        let validators: Vec<SigningKey> = (0..4u8).map(|i| SigningKey::from_bytes(&[30 + i; 32])).collect();
+    /// `n` nodes, the first `validators` of them in the genesis set.
+    fn build(n: usize, validators: usize, crashed: Vec<usize>, dirs: Option<Vec<PathBuf>>, staking: Staking) -> Devnet {
+        let keys: Vec<SigningKey> = (0..n as u8).map(|i| SigningKey::from_bytes(&[30 + i; 32])).collect();
         let genesis = Genesis {
             chain_id: CHAIN,
             params: params(),
-            validators: validators.iter().map(crypto::pubkey).collect(),
+            validators: keys[..validators].iter().map(crypto::pubkey).collect(),
             timestamp_ms: 0,
             launch: Default::default(),
+            staking,
         };
         let cfg = Config { base_timeout_ms: 200, max_timeout_ms: 2_000 };
         let mut starts = Vec::new();
-        let nodes = validators
+        let nodes = keys
             .iter()
             .enumerate()
             .map(|(i, k)| match &dirs {
                 Some(d) => {
-                    let (n, outs) = Node::open(&d[i], i as NodeId, k.clone(), genesis.clone(), cfg, 0).unwrap();
+                    let (node, outs) = Node::open(&d[i], k.clone(), genesis.clone(), cfg, 0).unwrap();
                     starts.push(outs);
-                    n
+                    node
                 }
                 None => {
-                    let mut n = Node::new(i as NodeId, k.clone(), genesis.clone(), cfg);
-                    starts.push(n.start(0));
-                    n
+                    let mut node = Node::new(k.clone(), genesis.clone(), cfg);
+                    starts.push(node.start(0));
+                    node
                 }
             })
             .collect();
         let mut net = Devnet {
             nodes,
-            validators,
+            keys,
             crashed,
             inbox: VecDeque::new(),
             now: 0,
@@ -92,37 +97,38 @@ impl Devnet {
         };
         for (i, outs) in starts.into_iter().enumerate() {
             if !net.crashed.contains(&i) {
-                net.route(i as NodeId, outs);
+                net.route(outs);
             }
         }
         net
     }
 
-    /// Kills validator `i` (its memory is gone).
     fn crash(&mut self, i: usize) {
         self.crashed.push(i);
     }
 
-    /// Brings validator `i` back from its data directory.
+    /// Brings node `i` back from its data directory.
     fn restart(&mut self, i: usize) {
         let dir = &self.dirs.as_ref().expect("persistent devnet")[i];
-        let (node, outs) =
-            Node::open(dir, i as NodeId, self.validators[i].clone(), self.genesis.clone(), self.cfg, self.now).unwrap();
+        let (node, outs) = Node::open(dir, self.keys[i].clone(), self.genesis.clone(), self.cfg, self.now).unwrap();
         self.nodes[i] = node;
         self.crashed.retain(|&c| c != i);
-        self.route(i as NodeId, outs);
+        self.route(outs);
     }
 
-    fn route(&mut self, from: NodeId, outs: Vec<Out>) {
+    fn route(&mut self, outs: Vec<NetOut>) {
         // Delivered next tick: 10 ms links.
         for o in outs {
             match o {
-                Out::Persist(_) => unreachable!("the node persists and strips these"),
-                Out::Send(to, m) => self.inbox.push_back((self.now + 10, from, to, m)),
-                Out::Broadcast(m) => {
-                    for to in 0..4 {
-                        if to != from {
-                            self.inbox.push_back((self.now + 10, from, to, m.clone()));
+                NetOut::Send(to, env) => {
+                    if let Some(i) = self.keys.iter().position(|k| crypto::pubkey(k) == to) {
+                        self.inbox.push_back((self.now + 10, i, env));
+                    }
+                }
+                NetOut::Broadcast(env) => {
+                    for i in 0..self.nodes.len() {
+                        if self.nodes[i].me != env.from {
+                            self.inbox.push_back((self.now + 10, i, env.clone()));
                         }
                     }
                 }
@@ -132,23 +138,20 @@ impl Devnet {
 
     fn step(&mut self) {
         self.now += 10;
-        let due: Vec<_> = {
-            let (due, later): (VecDeque<_>, VecDeque<_>) =
-                std::mem::take(&mut self.inbox).into_iter().partition(|(at, ..)| *at <= self.now);
-            self.inbox = later;
-            due.into_iter().collect()
-        };
-        for (_, from, to, m) in due {
-            if self.crashed.contains(&(to as usize)) {
+        let (due, later): (VecDeque<_>, VecDeque<_>) =
+            std::mem::take(&mut self.inbox).into_iter().partition(|(at, ..)| *at <= self.now);
+        self.inbox = later;
+        for (_, to, env) in due {
+            if self.crashed.contains(&to) {
                 continue;
             }
-            let outs = self.nodes[to as usize].on_message(from, m, self.now);
-            self.route(to, outs);
+            let outs = self.nodes[to].on_message(env, self.now);
+            self.route(outs);
         }
-        for i in 0..4 {
+        for i in 0..self.nodes.len() {
             if !self.crashed.contains(&i) {
                 let outs = self.nodes[i].on_tick(self.now);
-                self.route(i as NodeId, outs);
+                self.route(outs);
             }
         }
     }
@@ -159,9 +162,9 @@ impl Devnet {
         }
     }
 
-    /// Clients gossip to every live validator.
+    /// Clients gossip to every live node.
     fn broadcast_tx(&mut self, tx: Tx) {
-        for i in 0..4 {
+        for i in 0..self.nodes.len() {
             if !self.crashed.contains(&i) {
                 self.nodes[i].submit_tx(tx.clone());
             }
@@ -175,14 +178,22 @@ impl Devnet {
         self.broadcast_tx(tx);
     }
 
+    /// Deposit attested by the current validator set (as seen by node 0's
+    /// first live peer).
     fn deposit(&mut self, owner: &SigningKey, asset: u8, amount: u64) {
         let id = self.deposits;
         self.deposits += 1;
         let owner = crypto::pubkey(owner);
         let msg = crypto::deposit_message(CHAIN, id, &owner, asset, amount);
-        let attestations: Vec<Attestation> = (0..4)
-            .filter(|i| !self.crashed.contains(i))
-            .map(|i| Attestation { validator: i as u16, signature: crypto::sign(&self.validators[i], &msg) })
+        let set = self.live().next().unwrap().chain.validators.clone();
+        let attestations: Vec<Attestation> = set
+            .iter()
+            .enumerate()
+            .filter_map(|(vi, v)| {
+                let phys = self.keys.iter().position(|k| crypto::pubkey(k) == *v)?;
+                (!self.crashed.contains(&phys))
+                    .then(|| Attestation { validator: vi as u16, signature: crypto::sign(&self.keys[phys], &msg) })
+            })
             .collect();
         self.broadcast_tx(Tx::System(SystemTx::BridgeDeposit { deposit_id: id, owner, asset, amount, attestations }));
     }
@@ -235,17 +246,10 @@ fn scenario(crashed: Vec<usize>, phase_ms: u64) {
     net.user_tx(&b, Action::TransferToDex { dex: 0, amount: 1_000_000 });
     net.run(phase_ms);
     for i in 0..20u64 {
+        let price = 10_000 + i;
         net.user_tx(
             &a,
-            Action::PlaceOrder {
-                market: 0,
-                side: 1,
-                kind: 1,
-                price: 10_000 + i,
-                size: 2,
-                reduce_only: false,
-                client_id: i,
-            },
+            Action::PlaceOrder { market: 0, side: 1, kind: 1, price, size: 2, reduce_only: false, client_id: i },
         );
     }
     net.run(phase_ms);
@@ -286,12 +290,17 @@ fn agree_with_one_validator_down() {
     scenario(vec![2], 1_500);
 }
 
+fn temp_dirs(tag: &str, n: usize) -> (PathBuf, Vec<PathBuf>) {
+    let base = std::env::temp_dir().join(format!("mee-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dirs = (0..n).map(|i| base.join(format!("v{i}"))).collect();
+    (base, dirs)
+}
+
 #[test]
 fn restarted_validator_recovers_from_disk_and_catches_up() {
-    let base = std::env::temp_dir().join(format!("mee-devnet-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    let dirs: Vec<_> = (0..4).map(|i| base.join(format!("v{i}"))).collect();
-    let mut net = Devnet::with_storage(vec![], Some(dirs));
+    let (base, dirs) = temp_dirs("restart", 4);
+    let mut net = Devnet::build(4, 4, vec![], Some(dirs), Staking::default());
     let (dep, a) = (SigningKey::from_bytes(&[1; 32]), SigningKey::from_bytes(&[2; 32]));
     net.deposit(&dep, ASSET_STAKE, 5_000);
     net.deposit(&a, ASSET_QUOTE, 1_000_000);
@@ -317,5 +326,54 @@ fn restarted_validator_recovers_from_disk_and_catches_up() {
     let heights = net.assert_agreement();
     assert!(heights > progressed, "restarted node caught up: {heights} vs {progressed}");
     assert_eq!(net.nodes[1].chain.state.dexes.len(), 1, "it saw the DEX deployed while it was down");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn stake_rotates_validators_across_epochs() {
+    // Five nodes; four validate at genesis, node 4 observes. Each genesis
+    // validator carries 10 virtual stake; epochs end every 20 blocks.
+    let staking = Staking { epoch_blocks: 20, max_validators: 4, min_validator_stake: 10, unbond_secs: 1 };
+    let (base, dirs) = temp_dirs("epochs", 5);
+    let mut net = Devnet::build(5, 4, vec![], Some(dirs), staking);
+    assert!(!net.nodes[4].replica.is_validator());
+    let whale = SigningKey::from_bytes(&[9; 32]);
+    net.deposit(&whale, ASSET_STAKE, 1_000);
+    net.run(500);
+    let newcomer = net.nodes[4].me;
+    net.user_tx(&whale, Action::Delegate { validator: newcomer, amount: 500 });
+    net.run(3_000);
+
+    let heights = net.assert_agreement();
+    assert!(heights > 25, "only {heights} blocks");
+    let set = net.nodes[0].chain.validators.clone();
+    assert!(set.contains(&newcomer), "the staked observer joined the set");
+    assert_eq!(set.len(), 4);
+    let epochs: Vec<(u64, usize, bool)> =
+        net.nodes.iter().map(|n| (n.epoch, n.app_hashes.len(), n.replica.is_validator())).collect();
+    assert!(net.nodes.iter().all(|n| n.epoch == 1), "{epochs:?}");
+    assert!(net.nodes[4].replica.is_validator());
+    let out = net.nodes[1].outcomes.iter().find_map(|o| o.validator_set.clone()).expect("rotation recorded");
+    assert_eq!(out, (1, set.clone()));
+    let dropped = net.nodes.iter().position(|n| !set.contains(&n.me)).unwrap();
+    assert!(!net.nodes[dropped].replica.is_validator(), "the displaced validator now observes");
+
+    // The new set keeps producing blocks and attests deposits.
+    let user = SigningKey::from_bytes(&[8; 32]);
+    net.deposit(&user, ASSET_QUOTE, 777);
+    net.run(1_500);
+    let after = net.assert_agreement();
+    assert!(after > heights + 5);
+    let n = &net.nodes[0];
+    let id = n.chain.state.account_id(&crypto::pubkey(&user)).expect("deposit attested by the new set");
+    assert_eq!(n.chain.state.accounts[id as usize].balance, 777);
+
+    // An observer restarted from disk crosses the epoch in replay.
+    net.crash(dropped);
+    net.run(300);
+    net.restart(dropped);
+    assert_eq!(net.nodes[dropped].epoch, 1);
+    net.run(1_000);
+    net.assert_agreement();
     let _ = std::fs::remove_dir_all(&base);
 }

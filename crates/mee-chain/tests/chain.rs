@@ -47,6 +47,7 @@ impl Net {
             validators: validators.iter().map(crypto::pubkey).collect(),
             timestamp_ms: 0,
             launch: Default::default(),
+            staking: Default::default(),
         });
         Net { chain, validators, nonces: Default::default(), deposits: 0, ts: 0 }
     }
@@ -347,4 +348,49 @@ fn forged_signature_inside_a_parallel_batch_is_caught() {
     let bad: Vec<usize> = out.results.iter().enumerate().filter(|(_, r)| r.is_err()).map(|(i, _)| i).collect();
     assert_eq!(bad.len(), 1);
     assert_eq!(out.results[bad[0]], Err(TxError::BadSignature));
+}
+
+#[test]
+fn staking_elects_the_validator_set_each_epoch() {
+    let validators: Vec<SigningKey> = (100..104).map(key).collect();
+    let genesis_set: Vec<Pubkey> = validators.iter().map(crypto::pubkey).collect();
+    let mut net = Net::new();
+    net.chain = Chain::new(Genesis {
+        chain_id: CHAIN,
+        params: params(),
+        validators: genesis_set.clone(),
+        timestamp_ms: 0,
+        launch: Default::default(),
+        staking: Staking { epoch_blocks: 2, max_validators: 4, min_validator_stake: 10, unbond_secs: 100 },
+    });
+    let delegator = key(7);
+    let newcomer = crypto::pubkey(&key(200));
+    let dep = net.deposit_tx(&delegator, ASSET_STAKE, 1_000);
+    let out = net.ok(vec![dep]); // height 1
+    assert!(out.validator_set.is_none());
+    let d = net.tx(&delegator, Action::Delegate { validator: newcomer, amount: 500 });
+    let out = net.ok(vec![d]); // height 2: epoch boundary
+    let (epoch, set) = out.validator_set.expect("set changed");
+    assert_eq!(epoch, 1);
+    assert!(set.contains(&newcomer));
+    assert_eq!(set.len(), 4);
+    let dropped: Vec<_> = genesis_set.iter().filter(|v| !set.contains(v)).collect();
+    assert_eq!(dropped.len(), 1, "one genesis validator (largest key among equal stakes) is out");
+    assert_eq!(net.chain.validators, set);
+    // The bridge rotation message the outgoing set signs.
+    let msg = crypto::valset_message(CHAIN, 0, &set);
+    assert_ne!(msg, [0; 32]);
+
+    // Over-undelegating fails; a real undelegation unbonds and frees later.
+    let bad = net.tx(&delegator, Action::Undelegate { validator: newcomer, amount: 501 });
+    assert_eq!(net.block(vec![bad]).results, vec![Err(TxError::InsufficientStake)]); // height 3
+    let u = net.tx(&delegator, Action::Undelegate { validator: newcomer, amount: 500 });
+    let out = net.ok(vec![u]); // height 4: boundary again, newcomer has no stake
+    assert_eq!(out.validator_set.map(|(e, s)| (e, s.len())), Some((2, 4)));
+    assert!(!net.chain.validators.contains(&newcomer));
+    let a = net.chain.state.account_id(&crypto::pubkey(&delegator)).unwrap();
+    assert_eq!(net.chain.state.accounts[a as usize].stake_balance, 500);
+    net.ts += 100_000;
+    net.ok(vec![]);
+    assert_eq!(net.chain.state.accounts[a as usize].stake_balance, 1_000, "unbonded after the delay");
 }

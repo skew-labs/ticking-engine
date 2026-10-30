@@ -125,6 +125,17 @@ pub enum Action {
     SweepProtocolFees {
         dex: u32,
     },
+    // validator staking
+    /// Delegates free stake tokens to a validator key.
+    Delegate {
+        validator: Pubkey,
+        amount: u64,
+    },
+    /// Starts unbonding; the stake is free again after `unbond_secs`.
+    Undelegate {
+        validator: Pubkey,
+        amount: u64,
+    },
 }
 
 impl Action {

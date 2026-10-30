@@ -321,6 +321,7 @@ async fn rotation_needs_old_quorum_and_resets_approvals() {
     let new: Vec<SigningKey> = (0..7u8).map(|i| SigningKey::from_bytes(&[80 + i; 32])).collect();
     let new_keys: Vec<[u8; 32]> = new.iter().map(crypto::pubkey).collect();
     let msg = bridge::valset_message(CHAIN_ID, 0, &new_keys);
+    assert_eq!(msg, crypto::valset_message(CHAIN_ID, 0, &new_keys), "chain and bridge sign the same rotation");
     let wrong: Vec<_> = new.iter().take(5).map(|k| (crypto::pubkey(k), crypto::sign(k, &msg))).collect();
     env.fails(&[bridge::ed25519_instruction(&msg, &wrong), bridge::rotate_ix(&pid, new_keys.clone())], 1005).await;
     let ok = env.sigs(&msg, &[0, 1, 2]);

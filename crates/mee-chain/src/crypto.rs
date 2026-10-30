@@ -80,6 +80,21 @@ pub fn launch_oracle_message(chain_id: u64, slot: u64, updates: &[u8]) -> Hash {
     sha256(&[b"MEE/launch-oracle", &chain_id.to_le_bytes(), &slot.to_le_bytes(), updates])
 }
 
+/// What the outgoing validator set signs so the Solana bridge rotates to
+/// `validators`; `nonce` is the bridge's current `valset_nonce`. Must match
+/// `mee::bridge::valset_message` byte for byte.
+pub fn valset_message(chain_id: u64, nonce: u64, validators: &[Pubkey]) -> Hash {
+    let mut parts: Vec<&[u8]> = vec![b"MEE/valset"];
+    let c = chain_id.to_le_bytes();
+    let n = nonce.to_le_bytes();
+    parts.push(&c);
+    parts.push(&n);
+    for v in validators {
+        parts.push(v);
+    }
+    sha256(&parts)
+}
+
 /// What validators sign so light clients can trust a state root.
 pub fn state_root_message(chain_id: u64, height: u64, state_root: &Hash) -> Hash {
     sha256(&[b"MEE/state-root", &chain_id.to_le_bytes(), &height.to_le_bytes(), state_root])
