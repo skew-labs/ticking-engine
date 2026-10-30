@@ -3,12 +3,17 @@
 //! - Deposits lock tokens in a bridge vault and write a sequenced
 //!   `DepositRecord`; MEE validators attest records in order and the chain
 //!   credits them.
-//! - Withdrawals pay out a chain receipt once a validator quorum signed it.
-//!   Signatures are checked by Solana's Ed25519 precompile in the same
-//!   transaction; this program reads what was verified from the
-//!   instructions sysvar. A `WithdrawalRecord` PDA per receipt id makes each
-//!   payout happen once.
-//! - The validator set rotates only with a quorum of the current set.
+//! - Withdrawals (Hyperliquid-style): `RequestWithdrawal` records a chain
+//!   receipt; `ApproveWithdrawal` adds validator signatures, checked by
+//!   Solana's Ed25519 precompile in the same transaction and read back from
+//!   the instructions sysvar, and can be repeated across transactions (so the
+//!   validator set is not limited by transaction size); `FinalizeWithdrawal`
+//!   pays out once a quorum approved and the dispute window passed. The
+//!   record PDA per receipt id makes each payout happen once.
+//! - Any single validator can `LockBridge` (halting finalization) when it
+//!   sees fraud; a quorum can `UnlockBridge` or `CancelWithdrawal`.
+//! - The validator set rotates only with a quorum of the current set; old
+//!   approvals stop counting after a rotation.
 
 use bytemuck::{Pod, Zeroable};
 use mee_core::Key;
@@ -58,7 +63,12 @@ pub struct Bridge {
     pub threshold: u8,
     pub bump: u8,
     pub authority_bump: u8,
-    pub _pad: [u8; 4],
+    pub locked: u8,
+    pub _pad: [u8; 3],
+    /// Seconds between reaching quorum and being able to finalize.
+    pub dispute_secs: i64,
+    /// Bumped on every unlock so old lock signatures can't be replayed.
+    pub lock_nonce: u64,
 }
 
 #[repr(C)]
@@ -80,9 +90,20 @@ pub struct WithdrawalRecord {
     pub id: u64,
     pub destination: Key,
     pub amount: u64,
+    /// When approvals first reached the threshold (0 = not yet).
+    pub quorum_ts: i64,
+    /// Validator set the approvals belong to.
+    pub valset_nonce: u64,
+    /// Bitmap of approving validator indices.
+    pub approvals: u32,
     pub asset: u8,
-    pub _pad: [u8; 7],
+    pub status: u8,
+    pub _pad: [u8; 2],
 }
+
+pub const WITHDRAWAL_PENDING: u8 = 1;
+pub const WITHDRAWAL_PAID: u8 = 2;
+pub const WITHDRAWAL_CANCELLED: u8 = 3;
 
 pub fn quorum(n: usize) -> usize {
     n * 2 / 3 + 1
@@ -93,6 +114,18 @@ pub fn quorum(n: usize) -> usize {
 pub fn withdrawal_message(chain_id: u64, id: u64, asset: u8, destination: &[u8; 32], amount: u64) -> [u8; 32] {
     hashv(&[b"MEE/withdraw", &chain_id.to_le_bytes(), &id.to_le_bytes(), &[asset], destination, &amount.to_le_bytes()])
         .to_bytes()
+}
+
+pub fn lock_message(chain_id: u64, lock_nonce: u64) -> [u8; 32] {
+    hashv(&[b"MEE/lock", &chain_id.to_le_bytes(), &lock_nonce.to_le_bytes()]).to_bytes()
+}
+
+pub fn unlock_message(chain_id: u64, lock_nonce: u64) -> [u8; 32] {
+    hashv(&[b"MEE/unlock", &chain_id.to_le_bytes(), &lock_nonce.to_le_bytes()]).to_bytes()
+}
+
+pub fn cancel_message(chain_id: u64, id: u64) -> [u8; 32] {
+    hashv(&[b"MEE/cancel", &chain_id.to_le_bytes(), &id.to_le_bytes()]).to_bytes()
 }
 
 pub fn valset_message(chain_id: u64, nonce: u64, validators: &[[u8; 32]]) -> [u8; 32] {
@@ -156,18 +189,17 @@ pub fn ed25519_instruction(message: &[u8; 32], signatures: &[([u8; 32], [u8; 64]
     Instruction { program_id: ED25519_PROGRAM_ID, accounts: vec![], data }
 }
 
-/// Counts distinct current validators whose signature over `message` was
-/// verified by an Ed25519 precompile instruction in this transaction.
-/// Only entries whose offsets all point into the precompile instruction
-/// itself are counted, so what we read is exactly what was verified.
-fn verified_signers(instructions: &AccountInfo, bridge: &Bridge, message: &[u8; 32]) -> Result<usize, ProgramError> {
+/// Bitmap of current validators whose signature over `message` was verified
+/// by an Ed25519 precompile instruction in this transaction. Only entries
+/// whose offsets all point into the precompile instruction itself count, so
+/// what we read is exactly what was verified.
+fn verified_signers(instructions: &AccountInfo, bridge: &Bridge, message: &[u8; 32]) -> Result<u32, ProgramError> {
     if instructions.key != &INSTRUCTIONS_SYSVAR_ID {
         return Err(MeeError::InvalidAccountData.into());
     }
     #[allow(deprecated)]
     use solana_program::sysvar::instructions::load_instruction_at_checked;
-    let mut seen = [false; MAX_VALIDATORS];
-    let mut count = 0;
+    let mut seen = 0u32;
     let mut idx = 0usize;
     while let Ok(ix) = load_instruction_at_checked(idx, instructions) {
         idx += 1;
@@ -189,15 +221,16 @@ fn verified_signers(instructions: &AccountInfo, bridge: &Bridge, message: &[u8; 
                 continue;
             }
             let validators = &bridge.validators[..bridge.validator_count as usize];
-            if let Some(v) = validators.iter().position(|k| k[..] == pk[..])
-                && !seen[v]
-            {
-                seen[v] = true;
-                count += 1;
+            if let Some(v) = validators.iter().position(|k| k[..] == pk[..]) {
+                seen |= 1 << v;
             }
         }
     }
-    Ok(count)
+    Ok(seen)
+}
+
+fn signer_count(instructions: &AccountInfo, bridge: &Bridge, message: &[u8; 32]) -> Result<usize, ProgramError> {
+    Ok(verified_signers(instructions, bridge, message)?.count_ones() as usize)
 }
 
 // --- processing -----------------------------------------------------------------
@@ -254,7 +287,13 @@ fn mint_of(b: &Bridge, asset: u8) -> Result<Pubkey, ProgramError> {
     }
 }
 
-pub fn init(program_id: &Pubkey, it: &mut Accounts, chain_id: u64, validators: &[[u8; 32]]) -> ProgramResult {
+pub fn init(
+    program_id: &Pubkey,
+    it: &mut Accounts,
+    chain_id: u64,
+    validators: &[[u8; 32]],
+    dispute_secs: i64,
+) -> ProgramResult {
     let admin = next(it)?;
     let bridge_ai = next(it)?;
     let quote_mint = next(it)?;
@@ -287,7 +326,10 @@ pub fn init(program_id: &Pubkey, it: &mut Accounts, chain_id: u64, validators: &
         threshold: 0,
         bump,
         authority_bump,
-        _pad: [0; 4],
+        locked: 0,
+        _pad: [0; 3],
+        dispute_secs: dispute_secs.max(0),
+        lock_nonce: 0,
     };
     set_validators(&mut b, validators)?;
     token::create_pda_account(
@@ -374,8 +416,20 @@ pub fn deposit(program_id: &Pubkey, it: &mut Accounts, asset: u8, amount: u64) -
     store(bridge_ai, &b)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn withdraw(
+fn load_withdrawal(ai: &AccountInfo, program_id: &Pubkey, id: u64) -> Result<WithdrawalRecord, ProgramError> {
+    if ai.owner != program_id || ai.key != &withdrawal_pda(program_id, id).0 {
+        return Err(MeeError::InvalidPda.into());
+    }
+    let data = ai.try_borrow_data()?;
+    let r: &WithdrawalRecord = bytemuck::try_from_bytes(&data[..]).map_err(|_| MeeError::InvalidAccountData)?;
+    if r.discriminator != WITHDRAWAL_DISCRIMINATOR {
+        return Err(MeeError::InvalidAccountData.into());
+    }
+    Ok(*r)
+}
+
+/// [payer (s,w), bridge, record (w), system_program, rent]
+pub fn request_withdrawal(
     program_id: &Pubkey,
     it: &mut Accounts,
     id: u64,
@@ -386,34 +440,18 @@ pub fn withdraw(
     let payer = next(it)?;
     let bridge_ai = next(it)?;
     let record = next(it)?;
-    let vault = next(it)?;
-    let dest_token = next(it)?;
-    let authority = next(it)?;
-    let instructions = next(it)?;
-    let token_program = next(it)?;
     let system_program = next(it)?;
     let rent = Rent::from_account_info(next(it)?)?;
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
     let b = load_bridge(bridge_ai, program_id)?;
-    let mint = mint_of(&b, asset)?;
-    if vault.key != &vault_pda(program_id, &mint).0 {
-        return Err(MeeError::InvalidPda.into());
-    }
-    let dest = token::read_token_account(dest_token)?;
-    if dest.owner.to_bytes() != destination || dest.mint != mint {
-        return Err(MeeError::InvalidTokenAccount.into());
-    }
-    let msg = withdrawal_message(b.chain_id, id, asset, &destination, amount);
-    if verified_signers(instructions, &b, &msg)? < b.threshold as usize {
-        return Err(MeeError::Unauthorized.into());
-    }
+    mint_of(&b, asset)?;
     let (rp, rbump) = withdrawal_pda(program_id, id);
     if record.key != &rp {
         return Err(MeeError::InvalidPda.into());
     }
-    // Fails if the record exists: each receipt pays out once.
+    // Fails if the record exists: each receipt id is requested once, ever.
     token::create_pda_account(
         payer,
         record,
@@ -425,17 +463,138 @@ pub fn withdraw(
     )?;
     store(
         record,
-        &WithdrawalRecord { discriminator: WITHDRAWAL_DISCRIMINATOR, id, destination, amount, asset, _pad: [0; 7] },
-    )?;
+        &WithdrawalRecord {
+            discriminator: WITHDRAWAL_DISCRIMINATOR,
+            id,
+            destination,
+            amount,
+            quorum_ts: 0,
+            valset_nonce: b.valset_nonce,
+            approvals: 0,
+            asset,
+            status: WITHDRAWAL_PENDING,
+            _pad: [0; 2],
+        },
+    )
+}
+
+/// [bridge, record (w), instructions_sysvar, clock]. Adds the validator
+/// signatures verified in this transaction; repeatable.
+pub fn approve_withdrawal(program_id: &Pubkey, it: &mut Accounts, id: u64) -> ProgramResult {
+    let bridge_ai = next(it)?;
+    let record = next(it)?;
+    let instructions = next(it)?;
+    let clock = Clock::from_account_info(next(it)?)?;
+    let b = load_bridge(bridge_ai, program_id)?;
+    let mut r = load_withdrawal(record, program_id, id)?;
+    if r.status != WITHDRAWAL_PENDING {
+        return Err(MeeError::InvalidInstruction.into());
+    }
+    if r.valset_nonce != b.valset_nonce {
+        // The set rotated: earlier approvals were by the old set.
+        r.valset_nonce = b.valset_nonce;
+        r.approvals = 0;
+        r.quorum_ts = 0;
+    }
+    let msg = withdrawal_message(b.chain_id, r.id, r.asset, &r.destination, r.amount);
+    let signers = verified_signers(instructions, &b, &msg)?;
+    if signers == 0 {
+        return Err(MeeError::Unauthorized.into());
+    }
+    r.approvals |= signers;
+    if r.quorum_ts == 0 && r.approvals.count_ones() >= b.threshold as u32 {
+        r.quorum_ts = clock.unix_timestamp;
+    }
+    store(record, &r)
+}
+
+/// [bridge, record (w), vault (w), destination_token (w), authority,
+///  token_program, clock]. Permissionless.
+pub fn finalize_withdrawal(program_id: &Pubkey, it: &mut Accounts, id: u64) -> ProgramResult {
+    let bridge_ai = next(it)?;
+    let record = next(it)?;
+    let vault = next(it)?;
+    let dest_token = next(it)?;
+    let authority = next(it)?;
+    let token_program = next(it)?;
+    let clock = Clock::from_account_info(next(it)?)?;
+    let b = load_bridge(bridge_ai, program_id)?;
+    let mut r = load_withdrawal(record, program_id, id)?;
+    if b.locked != 0 {
+        return Err(MeeError::BridgeLocked.into());
+    }
+    if r.status != WITHDRAWAL_PENDING
+        || r.valset_nonce != b.valset_nonce
+        || r.quorum_ts == 0
+        || r.approvals.count_ones() < b.threshold as u32
+    {
+        return Err(MeeError::Unauthorized.into());
+    }
+    if clock.unix_timestamp < r.quorum_ts.saturating_add(b.dispute_secs) {
+        return Err(MeeError::DisputeWindow.into());
+    }
+    let mint = mint_of(&b, r.asset)?;
+    if vault.key != &vault_pda(program_id, &mint).0 {
+        return Err(MeeError::InvalidPda.into());
+    }
+    let dest = token::read_token_account(dest_token)?;
+    if dest.owner.to_bytes() != r.destination || dest.mint != mint {
+        return Err(MeeError::InvalidTokenAccount.into());
+    }
+    r.status = WITHDRAWAL_PAID;
+    store(record, &r)?;
     token::check_token_program(token_program)?;
     token::transfer(
         token_program,
         vault,
         dest_token,
         authority,
-        amount,
+        r.amount,
         &[&[BRIDGE_AUTHORITY_SEED, &[b.authority_bump]]],
     )
+}
+
+/// [bridge (w), instructions_sysvar]. One validator is enough to lock.
+pub fn lock(program_id: &Pubkey, it: &mut Accounts) -> ProgramResult {
+    let bridge_ai = next(it)?;
+    let instructions = next(it)?;
+    let mut b = load_bridge(bridge_ai, program_id)?;
+    if signer_count(instructions, &b, &lock_message(b.chain_id, b.lock_nonce))? == 0 {
+        return Err(MeeError::Unauthorized.into());
+    }
+    b.locked = 1;
+    store(bridge_ai, &b)
+}
+
+/// [bridge (w), instructions_sysvar]. Needs a quorum.
+pub fn unlock(program_id: &Pubkey, it: &mut Accounts) -> ProgramResult {
+    let bridge_ai = next(it)?;
+    let instructions = next(it)?;
+    let mut b = load_bridge(bridge_ai, program_id)?;
+    if signer_count(instructions, &b, &unlock_message(b.chain_id, b.lock_nonce))? < b.threshold as usize {
+        return Err(MeeError::Unauthorized.into());
+    }
+    b.locked = 0;
+    b.lock_nonce += 1;
+    store(bridge_ai, &b)
+}
+
+/// [bridge, record (w), instructions_sysvar]. A quorum voids a pending
+/// withdrawal during its dispute window.
+pub fn cancel_withdrawal(program_id: &Pubkey, it: &mut Accounts, id: u64) -> ProgramResult {
+    let bridge_ai = next(it)?;
+    let record = next(it)?;
+    let instructions = next(it)?;
+    let b = load_bridge(bridge_ai, program_id)?;
+    let mut r = load_withdrawal(record, program_id, id)?;
+    if r.status != WITHDRAWAL_PENDING {
+        return Err(MeeError::InvalidInstruction.into());
+    }
+    if signer_count(instructions, &b, &cancel_message(b.chain_id, id))? < b.threshold as usize {
+        return Err(MeeError::Unauthorized.into());
+    }
+    r.status = WITHDRAWAL_CANCELLED;
+    store(record, &r)
 }
 
 pub fn rotate(program_id: &Pubkey, it: &mut Accounts, validators: &[[u8; 32]]) -> ProgramResult {
@@ -443,7 +602,7 @@ pub fn rotate(program_id: &Pubkey, it: &mut Accounts, validators: &[[u8; 32]]) -
     let instructions = next(it)?;
     let mut b = load_bridge(bridge_ai, program_id)?;
     let msg = valset_message(b.chain_id, b.valset_nonce, validators);
-    if verified_signers(instructions, &b, &msg)? < b.threshold as usize {
+    if signer_count(instructions, &b, &msg)? < b.threshold as usize {
         return Err(MeeError::Unauthorized.into());
     }
     set_validators(&mut b, validators)?;
@@ -466,10 +625,11 @@ pub fn init_bridge_ix(
     stake_mint: &Pubkey,
     chain_id: u64,
     validators: Vec<[u8; 32]>,
+    dispute_secs: i64,
 ) -> Instruction {
     ix(
         program_id,
-        MeeInstruction::InitBridge { chain_id, validators },
+        MeeInstruction::InitBridge { chain_id, validators, dispute_secs },
         vec![
             AccountMeta::new(*admin, true),
             AccountMeta::new(bridge_pda(program_id).0, false),
@@ -512,14 +672,9 @@ pub fn deposit_ix(
     )
 }
 
-/// Pair with `ed25519_instruction(withdrawal_message(..), signatures)` placed
-/// earlier in the same transaction.
-#[allow(clippy::too_many_arguments)]
-pub fn withdraw_ix(
+pub fn request_withdrawal_ix(
     program_id: &Pubkey,
     payer: &Pubkey,
-    mint: &Pubkey,
-    destination_token: &Pubkey,
     id: u64,
     asset: u8,
     destination: [u8; 32],
@@ -527,18 +682,78 @@ pub fn withdraw_ix(
 ) -> Instruction {
     ix(
         program_id,
-        MeeInstruction::BridgeWithdraw { id, asset, destination, amount },
+        MeeInstruction::RequestWithdrawal { id, asset, destination, amount },
         vec![
             AccountMeta::new(*payer, true),
+            AccountMeta::new_readonly(bridge_pda(program_id).0, false),
+            AccountMeta::new(withdrawal_pda(program_id, id).0, false),
+            AccountMeta::new_readonly(token::SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(solana_program::sysvar::rent::ID, false),
+        ],
+    )
+}
+
+/// Pair with `ed25519_instruction(withdrawal_message(..), signatures)`
+/// earlier in the same transaction.
+pub fn approve_withdrawal_ix(program_id: &Pubkey, id: u64) -> Instruction {
+    ix(
+        program_id,
+        MeeInstruction::ApproveWithdrawal { id },
+        vec![
+            AccountMeta::new_readonly(bridge_pda(program_id).0, false),
+            AccountMeta::new(withdrawal_pda(program_id, id).0, false),
+            AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR_ID, false),
+            AccountMeta::new_readonly(solana_program::sysvar::clock::ID, false),
+        ],
+    )
+}
+
+pub fn finalize_withdrawal_ix(program_id: &Pubkey, mint: &Pubkey, destination_token: &Pubkey, id: u64) -> Instruction {
+    ix(
+        program_id,
+        MeeInstruction::FinalizeWithdrawal { id },
+        vec![
             AccountMeta::new_readonly(bridge_pda(program_id).0, false),
             AccountMeta::new(withdrawal_pda(program_id, id).0, false),
             AccountMeta::new(vault_pda(program_id, mint).0, false),
             AccountMeta::new(*destination_token, false),
             AccountMeta::new_readonly(authority_pda(program_id).0, false),
-            AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR_ID, false),
             AccountMeta::new_readonly(token::TOKEN_PROGRAM_ID, false),
-            AccountMeta::new_readonly(token::SYSTEM_PROGRAM_ID, false),
-            AccountMeta::new_readonly(solana_program::sysvar::rent::ID, false),
+            AccountMeta::new_readonly(solana_program::sysvar::clock::ID, false),
+        ],
+    )
+}
+
+pub fn lock_ix(program_id: &Pubkey) -> Instruction {
+    ix(
+        program_id,
+        MeeInstruction::LockBridge,
+        vec![
+            AccountMeta::new(bridge_pda(program_id).0, false),
+            AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR_ID, false),
+        ],
+    )
+}
+
+pub fn unlock_ix(program_id: &Pubkey) -> Instruction {
+    ix(
+        program_id,
+        MeeInstruction::UnlockBridge,
+        vec![
+            AccountMeta::new(bridge_pda(program_id).0, false),
+            AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR_ID, false),
+        ],
+    )
+}
+
+pub fn cancel_withdrawal_ix(program_id: &Pubkey, id: u64) -> Instruction {
+    ix(
+        program_id,
+        MeeInstruction::CancelWithdrawal { id },
+        vec![
+            AccountMeta::new_readonly(bridge_pda(program_id).0, false),
+            AccountMeta::new(withdrawal_pda(program_id, id).0, false),
+            AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR_ID, false),
         ],
     )
 }

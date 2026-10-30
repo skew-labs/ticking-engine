@@ -160,13 +160,22 @@ pub enum MeeInstruction {
     // --- MEE chain bridge (see `bridge`) ----------------------------------------
     /// [admin (s,w), bridge (w), quote_mint, stake_mint, quote_vault (w), stake_vault (w),
     ///  authority, token_program, system_program, rent]
-    InitBridge { chain_id: u64, validators: Vec<[u8; 32]> },
+    InitBridge { chain_id: u64, validators: Vec<[u8; 32]>, dispute_secs: i64 },
     /// [owner (s,w), bridge (w), deposit_record (w), source (w), vault (w), token_program,
     ///  system_program, rent, clock]
     BridgeDeposit { asset: u8, amount: u64 },
-    /// [payer (s,w), bridge, withdrawal_record (w), vault (w), destination_token (w), authority,
-    ///  instructions_sysvar, token_program, system_program, rent]
-    BridgeWithdraw { id: u64, asset: u8, destination: [u8; 32], amount: u64 },
+    /// [payer (s,w), bridge, record (w), system_program, rent]
+    RequestWithdrawal { id: u64, asset: u8, destination: [u8; 32], amount: u64 },
+    /// [bridge, record (w), instructions_sysvar, clock]
+    ApproveWithdrawal { id: u64 },
+    /// [bridge, record (w), vault (w), destination_token (w), authority, token_program, clock]
+    FinalizeWithdrawal { id: u64 },
+    /// [bridge (w), instructions_sysvar]
+    LockBridge,
+    /// [bridge (w), instructions_sysvar]
+    UnlockBridge,
+    /// [bridge, record (w), instructions_sysvar]
+    CancelWithdrawal { id: u64 },
     /// [bridge (w), instructions_sysvar]
     RotateValidators { validators: Vec<[u8; 32]> },
 

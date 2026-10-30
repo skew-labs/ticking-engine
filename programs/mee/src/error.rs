@@ -18,6 +18,8 @@ pub enum MeeError {
     BookMismatch = 1009,
     TooManyGuardians = 1010,
     SlippageExceeded = 1011,
+    BridgeLocked = 1012,
+    DisputeWindow = 1013,
 }
 
 impl From<MeeError> for ProgramError {
