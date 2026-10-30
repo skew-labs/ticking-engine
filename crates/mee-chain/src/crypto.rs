@@ -81,18 +81,25 @@ pub fn launch_oracle_message(chain_id: u64, slot: u64, updates: &[u8]) -> Hash {
 }
 
 /// What the outgoing validator set signs so the Solana bridge rotates to
-/// `validators`; `nonce` is the bridge's current `valset_nonce`. Must match
-/// `mee::bridge::valset_message` byte for byte.
-pub fn valset_message(chain_id: u64, nonce: u64, validators: &[Pubkey]) -> Hash {
+/// `validators` (key, voting weight); `nonce` is the bridge's current
+/// `valset_nonce`. Must match `mee::bridge::valset_message` byte for byte.
+pub fn valset_message(chain_id: u64, nonce: u64, validators: &[(Pubkey, u64)]) -> Hash {
+    let weights: Vec<[u8; 8]> = validators.iter().map(|(_, w)| w.to_le_bytes()).collect();
     let mut parts: Vec<&[u8]> = vec![b"MEE/valset"];
     let c = chain_id.to_le_bytes();
     let n = nonce.to_le_bytes();
     parts.push(&c);
     parts.push(&n);
-    for v in validators {
+    for ((v, _), w) in validators.iter().zip(&weights) {
         parts.push(v);
+        parts.push(w);
     }
     sha256(&parts)
+}
+
+/// More than two thirds of `total` weight.
+pub fn is_quorum(weight: u128, total: u128) -> bool {
+    3 * weight > 2 * total
 }
 
 /// What validators sign so light clients can trust a state root.

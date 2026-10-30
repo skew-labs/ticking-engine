@@ -30,22 +30,15 @@ use rustc_hash::FxHashMap;
 use crate::types::*;
 
 /// QC validity under a validator set: the genesis QC (round 0, no votes),
-/// or 2f+1 distinct valid votes.
-pub fn qc_is_valid(validators: &[Pubkey], genesis: &Hash, qc: &Qc) -> bool {
+/// or distinct valid votes carrying more than two thirds of the weight.
+pub fn qc_is_valid(committee: &Committee, genesis: &Hash, qc: &Qc) -> bool {
     if qc.round == 0 {
         return qc.block == *genesis && qc.votes.is_empty();
     }
     let msg = vote_message(&qc.block, qc.round);
-    let mut seen = vec![false; validators.len()];
-    let mut n = 0;
-    for (v, sig) in &qc.votes {
-        let i = *v as usize;
-        if i < seen.len() && !seen[i] && verify(&validators[i], &msg, sig) {
-            seen[i] = true;
-            n += 1;
-        }
-    }
-    n >= quorum(validators.len())
+    let valid =
+        qc.votes.iter().filter(|(v, sig)| committee.keys.get(*v as usize).is_some_and(|k| verify(k, &msg, sig)));
+    committee.is_quorum(committee.weight_of(valid.map(|(v, _)| *v)))
 }
 
 /// How a synced chain segment proves its last block is committed.
@@ -61,9 +54,9 @@ pub enum CommitProof {
 }
 
 /// Checks that `blocks` extend `prev` as a chain of certified blocks and
-/// that `proof` shows the last one committed, all under `validators`.
+/// that `proof` shows the last one committed, all under `committee`.
 pub fn verify_committed_segment(
-    validators: &[Pubkey],
+    committee: &Committee,
     genesis: &Hash,
     prev: &Hash,
     blocks: &[Block],
@@ -72,7 +65,7 @@ pub fn verify_committed_segment(
     let mut prev = *prev;
     let mut last_round = None;
     let check = |b: &Block, prev: &mut Hash| -> bool {
-        let ok = b.qc.block == *prev && qc_is_valid(validators, genesis, &b.qc);
+        let ok = b.qc.block == *prev && qc_is_valid(committee, genesis, &b.qc);
         *prev = b.hash();
         ok
     };
@@ -99,7 +92,7 @@ pub fn verify_committed_segment(
             certified.round == r + 1
                 && check(certified, &mut prev)
                 && qc.block == certified.hash()
-                && qc_is_valid(validators, genesis, qc)
+                && qc_is_valid(committee, genesis, qc)
         }
     }
 }
@@ -122,7 +115,7 @@ impl Default for Config {
 pub struct Replica {
     pub id: NodeId,
     key: SigningKey,
-    validators: Vec<Pubkey>,
+    validators: Committee,
     cfg: Config,
     genesis: Hash,
     blocks: FxHashMap<Hash, Block>,
@@ -151,7 +144,12 @@ pub struct Replica {
 }
 
 impl Replica {
+    /// Equal-weight validator set.
     pub fn new(id: NodeId, key: SigningKey, validators: Vec<Pubkey>, genesis: Hash, cfg: Config) -> Replica {
+        Replica::weighted(id, key, Committee::equal(validators), genesis, cfg)
+    }
+
+    pub fn weighted(id: NodeId, key: SigningKey, validators: Committee, genesis: Hash, cfg: Config) -> Replica {
         Replica {
             id,
             key,
@@ -221,9 +219,9 @@ impl Replica {
 
     /// A replica that follows commits (from proposals and their QCs) without
     /// voting, proposing or timing out: full nodes and validators-in-waiting.
-    pub fn observer(validators: Vec<Pubkey>, genesis: Hash, cfg: Config) -> Replica {
+    pub fn observer(validators: Committee, genesis: Hash, cfg: Config) -> Replica {
         // Any key works: an observer never signs.
-        Replica::new(NodeId::MAX, SigningKey::from_bytes(&[0; 32]), validators, genesis, cfg)
+        Replica::weighted(NodeId::MAX, SigningKey::from_bytes(&[0; 32]), validators, genesis, cfg)
     }
 
     pub fn is_validator(&self) -> bool {
@@ -247,15 +245,11 @@ impl Replica {
         }
         if seen == REPUTATION_WINDOW {
             let ids: Vec<NodeId> = (0..n as NodeId).filter(|&v| active & (1u64 << (v as u32 % 64)) != 0).collect();
-            if ids.len() >= quorum(n) {
+            if self.validators.is_quorum(self.validators.weight_of(ids.iter().copied())) {
                 return ids[(r % ids.len() as u64) as usize];
             }
         }
         (r % n as u64) as NodeId
-    }
-
-    fn quorum(&self) -> usize {
-        quorum(self.validators.len())
     }
 
     /// Queues a payload for the next block this replica proposes.
@@ -330,24 +324,23 @@ impl Replica {
     }
 
     fn valid_tc(&self, tc: &Tc) -> bool {
-        let mut seen = vec![false; self.validators.len()];
-        let mut n = 0;
         let mut max_hqc = 0;
+        let mut valid = Vec::new();
         for (v, hqr, sig) in &tc.timeouts {
-            let i = *v as usize;
-            if i < seen.len() && !seen[i] && verify(&self.validators[i], &timeout_message(tc.round, *hqr), sig) {
-                seen[i] = true;
-                n += 1;
+            if self.validators.keys.get(*v as usize).is_some_and(|k| verify(k, &timeout_message(tc.round, *hqr), sig)) {
+                valid.push(*v);
                 max_hqc = max_hqc.max(*hqr);
             }
         }
-        n >= self.quorum() && tc.high_qc.round == max_hqc && self.valid_qc(&tc.high_qc)
+        self.validators.is_quorum(self.validators.weight_of(valid))
+            && tc.high_qc.round == max_hqc
+            && self.valid_qc(&tc.high_qc)
     }
 
     fn valid_block(&self, b: &Block) -> bool {
         b.author == self.leader(b.round)
             && b.qc.round < b.round
-            && verify(&self.validators[b.author as usize], &proposal_message(&b.hash()), &b.signature)
+            && verify(&self.validators.keys[b.author as usize], &proposal_message(&b.hash()), &b.signature)
             && self.valid_qc(&b.qc)
     }
 
@@ -465,17 +458,19 @@ impl Replica {
             || !self.is_validator()
             || self.leader(v.round + 1) != self.id
             || v.round + 1 < self.round
-            || !verify(&self.validators[i], &vote_message(&v.block, v.round), &v.signature)
+            || !verify(&self.validators.keys[i], &vote_message(&v.block, v.round), &v.signature)
         {
             return;
         }
-        let q = self.quorum();
         let entry = self.votes.entry((v.block, v.round)).or_default();
         if entry.iter().any(|(who, _)| *who == v.voter) {
             return;
         }
+        let before = self.validators.weight_of(entry.iter().map(|(who, _)| *who));
         entry.push((v.voter, v.signature));
-        if entry.len() == q {
+        let after = before + self.validators.weights[i] as u128;
+        // Form the QC once: when the weight first crosses the quorum.
+        if !self.validators.is_quorum(before) && self.validators.is_quorum(after) {
             let qc = Qc { block: v.block, round: v.round, votes: entry.clone() };
             if !self.known(&v.block) {
                 out.push(Out::Send(v.voter, Message::Fetch(v.block)));
@@ -511,7 +506,7 @@ impl Replica {
     fn on_timeout(&mut self, t: Timeout, out: &mut Vec<Out>) {
         let i = t.voter as usize;
         if i >= self.validators.len()
-            || !verify(&self.validators[i], &timeout_message(t.round, t.high_qc.round), &t.signature)
+            || !verify(&self.validators.keys[i], &timeout_message(t.round, t.high_qc.round), &t.signature)
             || !self.valid_qc(&t.high_qc)
         {
             return;
@@ -526,16 +521,17 @@ impl Replica {
         if entry.iter().any(|x| x.voter == t.voter) {
             return;
         }
+        let before = self.validators.weight_of(entry.iter().map(|x| x.voter));
+        let after = before + self.validators.weights[i] as u128;
         entry.push(t);
-        let count = entry.len();
-        let f = (self.validators.len() - 1) / 3;
-        // Join a timeout that f+1 replicas started.
+        // Join a timeout that more than a third of the weight started (so at
+        // least one honest replica did).
         let joined = matches!(self.timeout_sent_at, Some((r, _)) if r >= round);
-        if count == f + 1 && round == self.round && !joined {
+        if self.validators.exceeds_third(after) && round == self.round && !joined {
             self.local_timeout(out);
             return;
         }
-        if count == self.quorum() && round >= self.round {
+        if !self.validators.is_quorum(before) && self.validators.is_quorum(after) && round >= self.round {
             let entry = &self.timeouts[&round];
             let high_qc = entry.iter().map(|x| &x.high_qc).max_by_key(|q| q.round).expect("non-empty").clone();
             let tc = Tc {

@@ -28,6 +28,62 @@ pub fn quorum(n: usize) -> usize {
     n * 2 / 3 + 1
 }
 
+/// A validator set with voting weights (stake). Quorum = more than two
+/// thirds of the total weight; "more than a third" guarantees at least one
+/// honest member when the faulty weight is below a third.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Committee {
+    pub keys: Vec<Pubkey>,
+    pub weights: Vec<u64>,
+}
+
+impl Committee {
+    pub fn new(keys: Vec<Pubkey>, weights: Vec<u64>) -> Committee {
+        assert_eq!(keys.len(), weights.len(), "one weight per key");
+        Committee { keys, weights }
+    }
+
+    /// Every member with weight 1.
+    pub fn equal(keys: Vec<Pubkey>) -> Committee {
+        let weights = vec![1; keys.len()];
+        Committee { keys, weights }
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn total(&self) -> u128 {
+        self.weights.iter().map(|w| *w as u128).sum()
+    }
+
+    /// Summed weight of distinct, in-range members.
+    pub fn weight_of(&self, ids: impl IntoIterator<Item = NodeId>) -> u128 {
+        let mut seen = vec![false; self.len()];
+        let mut w = 0;
+        for i in ids {
+            let i = i as usize;
+            if i < seen.len() && !seen[i] {
+                seen[i] = true;
+                w += self.weights[i] as u128;
+            }
+        }
+        w
+    }
+
+    pub fn is_quorum(&self, weight: u128) -> bool {
+        3 * weight > 2 * self.total()
+    }
+
+    pub fn exceeds_third(&self, weight: u128) -> bool {
+        3 * weight > self.total()
+    }
+}
+
 pub fn vote_message(block: &Hash, round: Round) -> Hash {
     sha256(&[b"MEE/vote", block, &round.to_le_bytes()])
 }

@@ -84,7 +84,7 @@ async fn status(State(s): S) -> Json<Value> {
         "timestamp_ms": n.chain.timestamp_ms,
         "app_hash": h(&n.chain.app_hash),
         "state_root": h(&n.chain.state_root),
-        "validators": n.chain.validators.iter().map(|v| h(v)).collect::<Vec<_>>(),
+        "validators": n.chain.committee().iter().map(|(k, w)| json!({ "key": h(k), "weight": w.to_string() })).collect::<Vec<_>>(),
         "is_validator": n.replica.is_validator(),
         "mempool": n.mempool().count(),
         "peers": peers,
@@ -176,8 +176,10 @@ async fn account(State(s): S, Path(key): Path<String>) -> Response {
 }
 
 async fn withdrawal(State(s): S, Path(id): Path<u64>) -> Response {
-    let n = s.node.lock().unwrap();
-    let Some(w) = n.chain.withdrawals.iter().find(|w| w.id == id).copied() else {
+    // Receipt ids are sequential from 0, so the id is the index. Copy it out
+    // and sign without holding the node lock.
+    let w = s.node.lock().unwrap().chain.withdrawals.get(id as usize).filter(|w| w.id == id).copied();
+    let Some(w) = w else {
         return err(StatusCode::NOT_FOUND, "no such withdrawal");
     };
     let msg = w.message(s.chain_id);
@@ -194,15 +196,18 @@ async fn withdrawal(State(s): S, Path(id): Path<u64>) -> Response {
 }
 
 async fn state_root(State(s): S, Path(height): Path<u64>) -> Response {
-    let n = s.node.lock().unwrap();
-    let Some(out) = height.checked_sub(1).and_then(|i| n.outcomes.get(i as usize)) else {
+    let roots = {
+        let n = s.node.lock().unwrap();
+        height.checked_sub(1).and_then(|i| n.outcomes.get(i as usize)).map(|o| (o.state_root, o.app_hash))
+    };
+    let Some((state_root, app_hash)) = roots else {
         return err(StatusCode::NOT_FOUND, "height not committed here");
     };
-    let msg = crypto::state_root_message(s.chain_id, height, &out.state_root);
+    let msg = crypto::state_root_message(s.chain_id, height, &state_root);
     Json(json!({
         "height": height,
-        "state_root": h(&out.state_root),
-        "app_hash": h(&out.app_hash),
+        "state_root": h(&state_root),
+        "app_hash": h(&app_hash),
         "signer": h(&s.me()),
         "signature": h(&s.sign(&msg)),
     }))
@@ -298,7 +303,8 @@ pub fn block_json(height: u64, out: &BlockOutcome) -> Value {
             "id": w.id, "asset": w.asset, "destination": h(&w.destination), "amount": w.amount.to_string(),
         })).collect::<Vec<_>>(),
         "validator_set": out.validator_set.as_ref().map(|(epoch, v)| json!({
-            "epoch": epoch, "validators": v.iter().map(|k| h(k)).collect::<Vec<_>>(),
+            "epoch": epoch,
+            "validators": v.iter().map(|(k, w)| json!({ "key": h(k), "weight": w.to_string() })).collect::<Vec<_>>(),
         })),
     })
 }

@@ -46,6 +46,9 @@ const TICK: Duration = Duration::from_millis(10);
 const STATUS_EVERY: Duration = Duration::from_secs(1);
 const SYNC_RETRY: Duration = Duration::from_millis(500);
 const PEER_QUEUE: usize = 4096;
+/// A sync target that leaves a request unanswered is skipped this long (a
+/// peer can claim any tip; it can't make us wait on it forever).
+const SYNC_PENALTY: Duration = Duration::from_secs(30);
 
 pub struct NetConfig {
     pub key: SigningKey,
@@ -261,14 +264,24 @@ struct SyncState {
     /// Best tip each peer announced: (epoch, height).
     tips: HashMap<Pubkey, (u64, u64)>,
     last_request: Option<Instant>,
+    /// The peer asked last and our height when we asked.
+    pending: Option<(Pubkey, u64)>,
+    /// Peers skipped as sync targets until the given time.
+    ignored: HashMap<Pubkey, Instant>,
 }
 
 impl SyncState {
-    /// The peer to sync from, if we are far enough behind one.
-    fn target(&self, epoch: u64, height: u64) -> Option<Pubkey> {
+    /// The peer to sync from, if we are far enough behind a connected,
+    /// non-penalized one.
+    fn target(&self, epoch: u64, height: u64, connected: &[Pubkey]) -> Option<Pubkey> {
+        let now = Instant::now();
         self.tips
             .iter()
-            .filter(|(_, (e, h))| *e > epoch || *h > height + SYNC_LAG)
+            .filter(|(k, (e, h))| {
+                (*e > epoch || *h > height + SYNC_LAG)
+                    && connected.contains(k)
+                    && self.ignored.get(*k).is_none_or(|until| *until <= now)
+            })
             .max_by_key(|(k, (e, h))| (*h, *e, **k))
             .map(|(k, _)| *k)
     }
@@ -353,12 +366,22 @@ fn maybe_sync(shared: &Shared, sync: &mut SyncState, progressed: bool) {
     if !progressed && sync.last_request.is_some_and(|t| t.elapsed() < SYNC_RETRY) {
         return;
     }
-    let (req, target) = {
+    let connected = shared.peer_keys();
+    sync.tips.retain(|k, _| connected.contains(k));
+    let (req, epoch, height) = {
         let n = shared.node.lock().unwrap();
-        (n.sync_request(), sync.target(n.epoch, n.height()))
+        (n.sync_request(), n.epoch, n.height())
     };
-    if let Some(peer) = target {
+    // The last target let a full retry interval pass without moving us.
+    if let Some((peer, at)) = sync.pending.take()
+        && !progressed
+        && height == at
+    {
+        sync.ignored.insert(peer, Instant::now() + SYNC_PENALTY);
+    }
+    if let Some(peer) = sync.target(epoch, height, &connected) {
         sync.last_request = Some(Instant::now());
+        sync.pending = Some((peer, height));
         let f = Arc::new(wire::encode(&Wire::SyncRequest(req)));
         shared.peers.lock().unwrap().send(&peer, &f);
     }

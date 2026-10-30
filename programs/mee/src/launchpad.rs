@@ -295,7 +295,7 @@ pub fn init(pid: &Pubkey, it: &mut Accounts, p: LaunchParams) -> ProgramResult {
     let treasury = next(it)?;
     let system_program = next(it)?;
     let rent = Rent::from_account_info(next(it)?)?;
-    require(admin.is_signer, MeeError::Unauthorized)?;
+    crate::pda::check_upgrade_authority(pid, next(it)?, admin)?;
     require(
         p.curve_supply > 0
             && p.curve_supply < p.total_supply
@@ -672,6 +672,7 @@ pub fn init_ix(
             AccountMeta::new_readonly(*treasury, false),
             AccountMeta::new_readonly(token::SYSTEM_PROGRAM_ID, false),
             AccountMeta::new_readonly(solana_program::sysvar::rent::ID, false),
+            AccountMeta::new_readonly(crate::pda::program_data(pid), false),
         ],
     )
 }

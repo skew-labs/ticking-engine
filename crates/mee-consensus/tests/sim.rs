@@ -139,3 +139,28 @@ fn restored_replica_never_votes_twice_in_a_round() {
     let outs = back.on_message(1, proposal, 3);
     assert!(!outs.iter().any(|o| matches!(o, Out::Send(_, Message::Vote(_)))));
 }
+
+#[test]
+fn quorum_is_by_weight_not_by_head_count() {
+    // Seven validators, weights 3,3,3,1,1,1,1 (total 13; quorum > 26/3).
+    let weights = Some(vec![3, 3, 3, 1, 1, 1, 1]);
+    let sim = |crashed: Vec<u16>, weights: Option<Vec<u64>>| {
+        run(&SimConfig { n: 7, crashed, weights, duration_ms: 30_000, ..SimConfig::default() })
+    };
+    // Three light nodes down: 10 of 13 is still a quorum, so it commits
+    // (with equal weights 4 of 7 would halt). Slow at first: three dead
+    // leaders in a row time out until leader reputation skips them.
+    let r = sim(vec![3, 4, 5], weights.clone());
+    assert!(r.safe());
+    let live = [0usize, 1, 2, 6];
+    assert!(r.min_commits(live.into_iter()) > 20, "light nodes down: {}", r.min_commits(live.into_iter()));
+    let r = sim(vec![3, 4, 5], None);
+    assert_eq!(r.min_commits(live.into_iter()), 0, "equal weights: 4 of 7 is not a quorum");
+
+    // Two heavy nodes down: five of seven nodes are up but only 7 of 13
+    // weight, so it must halt (safely); equal weights would carry on.
+    let r = sim(vec![0, 1], weights);
+    assert!(r.safe());
+    assert_eq!(r.min_commits(2..7), 0, "7 of 13 is not a quorum");
+    assert!(sim(vec![0, 1], None).min_commits(2..7) > 20);
+}

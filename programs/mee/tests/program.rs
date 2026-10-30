@@ -161,7 +161,8 @@ async fn setup() -> Env {
     let pid = mee::id();
     let mut pt = ProgramTest::new("mee", pid, processor!(mee::processor::process_instruction));
     pt.prefer_bpf(false);
-    let ctx = pt.start_with_context().await;
+    let mut ctx = pt.start_with_context().await;
+    set_upgrade_authority(&mut ctx, &pid);
 
     let quote_mint = Keypair::new();
     let stake_mint = Keypair::new();
@@ -456,4 +457,16 @@ async fn guardians_slash_and_freeze() {
     env.fails(&[mi::halt_market(&pid, &deployer.pubkey(), &dex_key, &book_key, 0, PRICE)], &[&deployer], 1005).await;
     let admin = env.ctx.payer.insecure_clone();
     env.ok(&[mi::halt_market(&pid, &admin.pubkey(), &dex_key, &book_key, 0, PRICE)], &[]).await;
+}
+
+/// Makes the payer the program's upgrade authority (who alone may init).
+fn set_upgrade_authority(ctx: &mut ProgramTestContext, pid: &Pubkey) {
+    let account = solana_account::Account {
+        lamports: 1_000_000_000,
+        data: mee::pda::program_data_header(&ctx.payer.pubkey()),
+        owner: mee::pda::UPGRADEABLE_LOADER_ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    ctx.set_account(&mee::pda::program_data(pid), &account.into());
 }

@@ -28,6 +28,8 @@ pub struct SimConfig {
     /// held back until `to_ms`.
     pub partition: Option<(u64, u64, Vec<NodeId>)>,
     pub consensus: Config,
+    /// Voting weights (stake); `None` = equal.
+    pub weights: Option<Vec<u64>>,
 }
 
 impl Default for SimConfig {
@@ -44,6 +46,7 @@ impl Default for SimConfig {
             equivocator: None,
             partition: None,
             consensus: Config { base_timeout_ms: 300, max_timeout_ms: 5_000 },
+            weights: None,
         }
     }
 }
@@ -110,8 +113,12 @@ pub fn run(cfg: &SimConfig) -> SimResult {
     let keys: Vec<SigningKey> = (0..cfg.n).map(|i| key_for(cfg.seed, i)).collect();
     let validators: Vec<Pubkey> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
     let genesis = sha256(&[b"MEE/genesis-sim", &cfg.seed.to_le_bytes()]);
+    let committee = match &cfg.weights {
+        Some(w) => Committee::new(validators, w.clone()),
+        None => Committee::equal(validators),
+    };
     let mut nodes: Vec<Replica> = (0..cfg.n)
-        .map(|i| Replica::new(i as NodeId, keys[i].clone(), validators.clone(), genesis, cfg.consensus))
+        .map(|i| Replica::weighted(i as NodeId, keys[i].clone(), committee.clone(), genesis, cfg.consensus))
         .collect();
     let alive = |i: usize| !cfg.crashed.contains(&(i as NodeId));
     let mut rng = Rng(cfg.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);

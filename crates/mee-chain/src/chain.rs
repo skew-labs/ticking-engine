@@ -149,7 +149,7 @@ pub struct BlockOutcome {
     /// Set when this block ended an epoch with a new validator set: (new
     /// epoch, new set). The old set signs `crypto::valset_message` for the
     /// Solana bridge.
-    pub validator_set: Option<(u64, Vec<Pubkey>)>,
+    pub validator_set: Option<(u64, Vec<(Pubkey, u64)>)>,
     pub app_hash: Hash,
 }
 
@@ -184,8 +184,15 @@ pub struct Chain {
     /// with `min_validator_stake` of virtual, non-withdrawable stake).
     pub stakes: std::collections::BTreeMap<Pubkey, u64>,
     pub delegations: std::collections::BTreeMap<(AccountId, Pubkey), u64>,
-    /// (ready at unix seconds, account, amount), in request order.
-    pub unbonding: Vec<(i64, AccountId, u64)>,
+    /// (ready at unix seconds, requested at height, account, amount), in
+    /// request order.
+    pub unbonding: Vec<(i64, u64, AccountId, u64)>,
+    /// Voting weight of each validator (same order as `validators`): its
+    /// stake at the election, or the genesis weight.
+    pub validator_weights: Vec<u64>,
+    /// Keys that proved control (`RegisterValidator`): only these can be
+    /// elected.
+    pub registered: std::collections::BTreeSet<Pubkey>,
 }
 
 impl Chain {
@@ -215,7 +222,19 @@ impl Chain {
             stakes: g.validators.iter().map(|v| (*v, g.staking.min_validator_stake)).collect(),
             delegations: Default::default(),
             unbonding: Vec::new(),
+            validator_weights: vec![g.staking.min_validator_stake.max(1); g.validators.len()],
+            registered: g.validators.iter().copied().collect(),
         }
+    }
+
+    /// Total voting weight of the current set.
+    pub fn total_weight(&self) -> u128 {
+        self.validator_weights.iter().map(|w| *w as u128).sum()
+    }
+
+    /// The current set as (key, weight), in set order.
+    pub fn committee(&self) -> Vec<(Pubkey, u64)> {
+        self.validators.iter().copied().zip(self.validator_weights.iter().copied()).collect()
     }
 
     /// Mempool admission: signature and nonce, no execution.
@@ -314,7 +333,7 @@ impl Chain {
 
     fn check_quorum(&self, msg: &Hash, attestations: &[Attestation]) -> Result<(), TxError> {
         let mut seen = vec![false; self.validators.len()];
-        let mut valid = 0;
+        let mut weight = 0u128;
         for a in attestations {
             let i = a.validator as usize;
             if i >= self.validators.len() || seen[i] {
@@ -322,10 +341,10 @@ impl Chain {
             }
             if crypto::verify(&self.validators[i], msg, &a.signature) {
                 seen[i] = true;
-                valid += 1;
+                weight += self.validator_weights[i] as u128;
             }
         }
-        if valid >= crypto::quorum(self.validators.len()) { Ok(()) } else { Err(TxError::NoQuorum) }
+        if crypto::is_quorum(weight, self.total_weight()) { Ok(()) } else { Err(TxError::NoQuorum) }
     }
 
     /// Applies a committed block. Individual transactions may fail (their
@@ -355,11 +374,12 @@ impl Chain {
         let e = self.staking.epoch_blocks;
         if e > 0 && self.height.is_multiple_of(e) {
             let next = self.elect();
-            let mut current = self.validators.clone();
+            let mut current = self.committee();
             current.sort();
-            // Same members in another order is not a change.
+            // Same members and weights in another order is not a change.
             if next != current {
-                self.validators = next.clone();
+                self.validators = next.iter().map(|(k, _)| *k).collect();
+                self.validator_weights = next.iter().map(|(_, w)| *w).collect();
                 self.epoch += 1;
                 out.validator_set = Some((self.epoch, next));
             }
@@ -493,21 +513,38 @@ impl Chain {
     }
 
     /// Top `max_validators` keys by stake (ties by key), each with at least
-    /// `min_validator_stake`, in key order.
-    pub fn elect(&self) -> Vec<Pubkey> {
-        let mut c: Vec<(&Pubkey, &u64)> =
-            self.stakes.iter().filter(|(_, s)| **s >= self.staking.min_validator_stake).collect();
-        c.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        let mut set: Vec<Pubkey> = c.into_iter().take(self.staking.max_validators).map(|(k, _)| *k).collect();
-        set.sort();
-        if set.is_empty() { self.validators.clone() } else { set }
+    /// `min_validator_stake`, registered, in key order, weighted by stake.
+    /// Voting power is the stake itself, so a quorum always means more than
+    /// two thirds of the elected stake, however many seats it is spread over.
+    pub fn elect(&self) -> Vec<(Pubkey, u64)> {
+        let mut c: Vec<(Pubkey, u64)> = self
+            .stakes
+            .iter()
+            .filter(|(k, s)| **s >= self.staking.min_validator_stake.max(1) && self.registered.contains(*k))
+            .map(|(k, s)| (*k, *s))
+            .collect();
+        c.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        c.truncate(self.staking.max_validators);
+        c.sort();
+        if c.is_empty() {
+            let mut cur = self.committee();
+            cur.sort();
+            cur
+        } else {
+            c
+        }
     }
 
     fn release_unbonded(&mut self) {
         let now = self.timestamp_ms / 1_000;
-        let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.unbonding).into_iter().partition(|u| u.0 <= now);
+        let (e, height) = (self.staking.epoch_blocks, self.height);
+        // Locked until an election strictly before this block has dropped it
+        // from the voting weights.
+        let past_election = |requested: u64| e == 0 || (height - 1) / e > requested / e;
+        let (ready, wait): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.unbonding).into_iter().partition(|u| u.0 <= now && past_election(u.1));
         self.unbonding = wait;
-        for (_, a, amount) in ready {
+        for (_, _, a, amount) in ready {
             let acct = &mut self.state.accounts[a as usize];
             acct.stake_balance = acct.stake_balance.saturating_add(amount);
         }
@@ -524,13 +561,19 @@ impl Chain {
             buf.extend_from_slice(k);
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        for (t, a, v) in &self.unbonding {
+        for (t, h, a, v) in &self.unbonding {
             buf.extend_from_slice(&t.to_le_bytes());
+            buf.extend_from_slice(&h.to_le_bytes());
             buf.extend_from_slice(&a.to_le_bytes());
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        for v in &self.validators {
+        for (v, w) in self.validators.iter().zip(&self.validator_weights) {
             buf.extend_from_slice(v);
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        buf.extend_from_slice(b"registered");
+        for k in &self.registered {
+            buf.extend_from_slice(k);
         }
         crypto::sha256(&[b"MEE/staking", &self.epoch.to_le_bytes(), &buf])
     }
@@ -692,7 +735,11 @@ impl Chain {
                 if *s == 0 {
                     self.stakes.remove(validator);
                 }
-                self.unbonding.push((self.timestamp_ms / 1_000 + self.staking.unbond_secs, a, *amount));
+                self.unbonding.push((self.timestamp_ms / 1_000 + self.staking.unbond_secs, self.height, a, *amount));
+                Ok(())
+            }
+            Action::RegisterValidator => {
+                self.registered.insert(*signer);
                 Ok(())
             }
         };

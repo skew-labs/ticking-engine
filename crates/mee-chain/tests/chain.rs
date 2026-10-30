@@ -364,33 +364,46 @@ fn staking_elects_the_validator_set_each_epoch() {
         staking: Staking { epoch_blocks: 2, max_validators: 4, min_validator_stake: 10, unbond_secs: 100 },
     });
     let delegator = key(7);
-    let newcomer = crypto::pubkey(&key(200));
+    let newcomer_key = key(200);
+    let newcomer = crypto::pubkey(&newcomer_key);
     let dep = net.deposit_tx(&delegator, ASSET_STAKE, 1_000);
-    let out = net.ok(vec![dep]); // height 1
+    let dep2 = net.deposit_tx(&newcomer_key, ASSET_QUOTE, 1);
+    let out = net.ok(vec![dep, dep2]); // height 1
     assert!(out.validator_set.is_none());
+    // Stake alone can't elect a key that never proved it is controlled.
     let d = net.tx(&delegator, Action::Delegate { validator: newcomer, amount: 500 });
     let out = net.ok(vec![d]); // height 2: epoch boundary
+    assert!(out.validator_set.is_none(), "unregistered keys are not eligible");
+    let r = net.tx(&newcomer_key, Action::RegisterValidator);
+    net.ok(vec![r]); // height 3
+    let out = net.ok(vec![]); // height 4: boundary
     let (epoch, set) = out.validator_set.expect("set changed");
     assert_eq!(epoch, 1);
-    assert!(set.contains(&newcomer));
+    assert!(set.contains(&(newcomer, 500)), "weight = stake");
     assert_eq!(set.len(), 4);
-    let dropped: Vec<_> = genesis_set.iter().filter(|v| !set.contains(v)).collect();
+    let keys: Vec<Pubkey> = set.iter().map(|(k, _)| *k).collect();
+    let dropped: Vec<_> = genesis_set.iter().filter(|v| !keys.contains(v)).collect();
     assert_eq!(dropped.len(), 1, "one genesis validator (largest key among equal stakes) is out");
-    assert_eq!(net.chain.validators, set);
+    assert_eq!(net.chain.validators, keys);
+    assert_eq!(net.chain.total_weight(), 530);
     // The bridge rotation message the outgoing set signs.
     let msg = crypto::valset_message(CHAIN, 0, &set);
-    assert_ne!(msg, [0; 32]);
+    assert_ne!(msg, crypto::valset_message(CHAIN, 0, &[(newcomer, 499)]));
 
-    // Over-undelegating fails; a real undelegation unbonds and frees later.
+    // Over-undelegating fails; a real undelegation stops counting at the
+    // next election but stays locked until that election has passed.
     let bad = net.tx(&delegator, Action::Undelegate { validator: newcomer, amount: 501 });
-    assert_eq!(net.block(vec![bad]).results, vec![Err(TxError::InsufficientStake)]); // height 3
+    assert_eq!(net.block(vec![bad]).results, vec![Err(TxError::InsufficientStake)]); // height 5
     let u = net.tx(&delegator, Action::Undelegate { validator: newcomer, amount: 500 });
-    let out = net.ok(vec![u]); // height 4: boundary again, newcomer has no stake
+    let out = net.ok(vec![u]); // height 6: boundary again, newcomer has no stake
     assert_eq!(out.validator_set.map(|(e, s)| (e, s.len())), Some((2, 4)));
     assert!(!net.chain.validators.contains(&newcomer));
     let a = net.chain.state.account_id(&crypto::pubkey(&delegator)).unwrap();
     assert_eq!(net.chain.state.accounts[a as usize].stake_balance, 500);
     net.ts += 100_000;
-    net.ok(vec![]);
-    assert_eq!(net.chain.state.accounts[a as usize].stake_balance, 1_000, "unbonded after the delay");
+    net.ok(vec![]); // height 7: the delay passed but the requesting block was itself a boundary
+    net.ok(vec![]); // height 8: boundary
+    assert_eq!(net.chain.state.accounts[a as usize].stake_balance, 500, "still backing the epoch it counted in");
+    net.ok(vec![]); // height 9
+    assert_eq!(net.chain.state.accounts[a as usize].stake_balance, 1_000, "unbonded after the next election");
 }

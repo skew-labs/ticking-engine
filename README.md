@@ -30,4 +30,4 @@ for i in 0 1 2 3; do ./target/release/mee-validator --index $i --data ./data & d
 curl localhost:8600/status
 ```
 
-툴체인은 `rust-toolchain.toml`(1.97.0)에 고정돼 있다. 아직 프로토타입이고 감사 전이다. 남은 일은 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#12-한계와-다음-단계)에 정리했다.
+툴체인은 `rust-toolchain.toml`(1.97.0)에 고정돼 있다. 아직 프로토타입이고 감사 전이다. 남은 일은 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#13-한계와-다음-단계)에 정리했다.

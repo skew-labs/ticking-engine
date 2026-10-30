@@ -3213,6 +3213,7 @@ dependencies = [
  "mee-chain",
  "mee-core",
  "mee-engine",
+ "solana-account 4.3.2",
  "solana-keypair",
  "solana-program",
  "solana-program-test",

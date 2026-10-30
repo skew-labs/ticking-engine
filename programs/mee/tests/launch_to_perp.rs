@@ -120,6 +120,7 @@ async fn graduated_token_gets_a_perp() {
     let mut pt = ProgramTest::new("mee", pid, processor!(mee::processor::process_instruction));
     pt.prefer_bpf(false);
     let mut sol = Sol { ctx: pt.start_with_context().await, pid };
+    set_upgrade_authority(&mut sol.ctx, &pid);
     let payer = sol.ctx.payer.pubkey();
     let usdc = Keypair::new();
     let rent = sol.ctx.banks_client.get_rent().await.unwrap();
@@ -302,4 +303,16 @@ async fn graduated_token_gets_a_perp() {
     assert!(m.cfg.oi_cap > first_cap, "deeper pool, larger OI cap");
     let out = block(&mut c, vec![vals.oracle(slot, upd)]);
     assert_eq!(out.results, vec![Err(chain::TxError::StaleOracle)], "an old observation can't be replayed");
+}
+
+/// Makes the payer the program's upgrade authority (who alone may init).
+fn set_upgrade_authority(ctx: &mut ProgramTestContext, pid: &Pubkey) {
+    let account = solana_account::Account {
+        lamports: 1_000_000_000,
+        data: mee::pda::program_data_header(&ctx.payer.pubkey()),
+        owner: mee::pda::UPGRADEABLE_LOADER_ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    ctx.set_account(&mee::pda::program_data(pid), &account.into());
 }

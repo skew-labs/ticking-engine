@@ -99,7 +99,8 @@ pub struct OrderArgs {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum MeeInstruction {
     // --- governance -----------------------------------------------------------
-    /// [admin (s,w), exchange (w), quote_mint, stake_mint, treasury_quote, treasury_stake, system_program, rent]
+    /// [admin (s,w), exchange (w), quote_mint, stake_mint, treasury_quote, treasury_stake, system_program, rent,
+    ///  program_data]. `admin` must be the program's upgrade authority.
     InitExchange { params: ParamsArgs, guardians: Vec<[u8; 32]>, guardian_threshold: u8 },
     /// [admin (s), exchange (w)]
     UpdateExchange { params: ParamsArgs, guardians: Vec<[u8; 32]>, guardian_threshold: u8, new_admin: Option<[u8; 32]> },
@@ -159,8 +160,8 @@ pub enum MeeInstruction {
 
     // --- MEE chain bridge (see `bridge`) ----------------------------------------
     /// [admin (s,w), bridge (w), quote_mint, stake_mint, quote_vault (w), stake_vault (w),
-    ///  authority, token_program, system_program, rent]
-    InitBridge { chain_id: u64, validators: Vec<[u8; 32]>, dispute_secs: i64 },
+    ///  authority, token_program, system_program, rent, program_data]. Upgrade authority only.
+    InitBridge { chain_id: u64, validators: Vec<([u8; 32], u64)>, dispute_secs: i64 },
     /// [owner (s,w), bridge (w), deposit_record (w), source (w), vault (w), token_program,
     ///  system_program, rent, clock]
     BridgeDeposit { asset: u8, amount: u64 },
@@ -177,10 +178,10 @@ pub enum MeeInstruction {
     /// [bridge, record (w), instructions_sysvar]
     CancelWithdrawal { id: u64 },
     /// [bridge (w), instructions_sysvar]
-    RotateValidators { validators: Vec<[u8; 32]> },
+    RotateValidators { validators: Vec<([u8; 32], u64)> },
 
     // --- launchpad (see `launchpad`) ---------------------------------------------
-    /// [admin (s,w), config (w), quote_mint, treasury, system_program, rent]
+    /// [admin (s,w), config (w), quote_mint, treasury, system_program, rent, program_data]. Upgrade authority only.
     InitLaunchpad { params: crate::launchpad::LaunchParams },
     /// [creator (s,w), config (w), launch (w), mint (w), token_vault (w), quote_vault (w),
     ///  quote_mint, authority, token_program, system_program, rent, clock]
@@ -243,6 +244,7 @@ pub fn init_exchange(
             r(treasury_stake),
             r(&SYSTEM_PROGRAM_ID),
             r(&RENT),
+            r(&pda::program_data(program_id)),
         ],
     )
 }

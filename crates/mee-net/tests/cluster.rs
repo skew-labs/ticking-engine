@@ -216,6 +216,22 @@ async fn four_validators_over_tcp_with_api_gossip_and_late_observer() {
     let target = http(api[0], "GET", "/status", None).await["height"].as_u64().unwrap();
     assert!(target > mee_net::SYNC_LAG);
     let observer = launch(9, 4, bind().await, vec![nodes[1].p2p_addr]).await;
+    // A liar connects too, claims a huge tip and never serves sync: the
+    // observer must give up on it and sync from the honest peer.
+    let liar_addr = observer.p2p_addr;
+    let liar = tokio::spawn(async move {
+        let mut s = TcpStream::connect(liar_addr).await.unwrap();
+        mee_net::wire::handshake(&mut s, &SigningKey::from_bytes(&[66; 32]), CHAIN).await.unwrap();
+        let (mut rd, mut wr) = s.into_split();
+        tokio::spawn(async move { while mee_net::wire::read_frame(&mut rd).await.is_ok() {} });
+        loop {
+            let lie = mee_net::wire::encode(&mee_net::wire::Wire::Status { epoch: 0, height: u64::MAX / 2 });
+            if wr.write_all(&lie).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
     wait_for("observer caught up", 30, async || observer.shared.node.lock().unwrap().height() > target + 5).await;
     let (h, mine) = {
         let n = observer.shared.node.lock().unwrap();
@@ -225,6 +241,7 @@ async fn four_validators_over_tcp_with_api_gossip_and_late_observer() {
     assert_eq!(mine[..h as usize], theirs[..], "observer agrees at every height");
     assert_eq!(observer.shared.node.lock().unwrap().chain.state.markets[0].open_interest, 5);
 
+    liar.abort();
     observer.shutdown();
     for n in nodes {
         n.shutdown();

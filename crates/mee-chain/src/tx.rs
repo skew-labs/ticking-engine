@@ -131,11 +131,16 @@ pub enum Action {
         validator: Pubkey,
         amount: u64,
     },
-    /// Starts unbonding; the stake is free again after `unbond_secs`.
+    /// Starts unbonding. The stake stops counting at the next election but
+    /// stays locked until that election has passed and `unbond_secs` have
+    /// elapsed, so it backs every epoch it voted in.
     Undelegate {
         validator: Pubkey,
         amount: u64,
     },
+    /// Makes the signer's key eligible for election. Signed by the key
+    /// itself, so stake can't elect keys nobody controls.
+    RegisterValidator,
 }
 
 impl Action {

@@ -109,7 +109,8 @@ async fn setup() -> Env {
     let pid = mee::id();
     let mut pt = ProgramTest::new("mee", pid, processor!(mee::processor::process_instruction));
     pt.prefer_bpf(false);
-    let ctx = pt.start_with_context().await;
+    let mut ctx = pt.start_with_context().await;
+    set_upgrade_authority(&mut ctx, &pid);
     let mut env = Env { ctx, pid, usdc: Pubkey::default(), treasury: Pubkey::default() };
     let payer = env.ctx.payer.pubkey();
     let mint = Keypair::new();
@@ -258,4 +259,16 @@ async fn launches_are_independent() {
     assert_eq!(env.check(0).await.real_quote, 0);
     assert!(env.check(1).await.real_quote > 0);
     assert_eq!(env.check(2).await.real_quote, 0);
+}
+
+/// Makes the payer the program's upgrade authority (who alone may init).
+fn set_upgrade_authority(ctx: &mut ProgramTestContext, pid: &Pubkey) {
+    let account = solana_account::Account {
+        lamports: 1_000_000_000,
+        data: mee::pda::program_data_header(&ctx.payer.pubkey()),
+        owner: mee::pda::UPGRADEABLE_LOADER_ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    ctx.set_account(&mee::pda::program_data(pid), &account.into());
 }

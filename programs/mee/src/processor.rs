@@ -548,7 +548,7 @@ fn init_exchange(
     let treasury_stake = next(it)?;
     let system_program = next(it)?;
     let rent = Rent::from_account_info(next(it)?)?;
-    require_signer(admin)?;
+    pda::check_upgrade_authority(program_id, next(it)?, admin)?;
     check_guardians(guardians, threshold)?;
     let (expected, bump) = pda::exchange(program_id);
     if exchange_ai.key != &expected {

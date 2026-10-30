@@ -19,7 +19,9 @@ use std::path::Path;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::SigningKey;
 use mee_chain::{Block, BlockOutcome, Chain, Genesis, Tx, crypto};
-use mee_consensus::{CommitProof, Config, Hash, Message, NodeId, Out, Pubkey, Qc, Replica, verify_committed_segment};
+use mee_consensus::{
+    CommitProof, Committee, Config, Hash, Message, NodeId, Out, Pubkey, Qc, Replica, verify_committed_segment,
+};
 
 use crate::storage::Storage;
 
@@ -64,6 +66,15 @@ pub enum SyncError {
 pub const SYNC_BATCH: usize = 256;
 /// Payload bytes per sync response (soft limit; one block may exceed it).
 pub const SYNC_BYTES: usize = 16 << 20;
+/// A proposal whose timestamp is further ahead of the local clock gets no
+/// vote, so one malicious leader can't push chain time into the future
+/// (which would release time locks early and then freeze time).
+pub const MAX_CLOCK_DRIFT_MS: i64 = 2_000;
+/// Mempool limits: transactions are free, so admission is bounded.
+pub const MAX_MEMPOOL: usize = 200_000;
+pub const MAX_PENDING_PER_SENDER: usize = 64;
+/// How far past an account's nonce a pending transaction may be.
+pub const MAX_NONCE_AHEAD: u64 = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetOut {
@@ -82,6 +93,8 @@ pub struct Node {
     /// (tx hash, tx); `in_pool` dedups gossip.
     mempool: Vec<(Hash, Tx)>,
     in_pool: std::collections::HashSet<Hash>,
+    /// Pending user transactions per signer.
+    per_sender: std::collections::HashMap<Pubkey, usize>,
     /// Messages for a future epoch, replayed once we switch.
     future: Vec<Envelope>,
     /// App hash after each applied height (index = height - 1).
@@ -115,12 +128,16 @@ fn consensus_genesis(chain: &Chain) -> Hash {
     }
 }
 
+fn committee(chain: &Chain) -> Committee {
+    Committee::new(chain.validators.clone(), chain.validator_weights.clone())
+}
+
 fn make_replica(key: &SigningKey, chain: &Chain, cfg: Config) -> Replica {
     let me = crypto::pubkey(key);
     let genesis = consensus_genesis(chain);
     match chain.validators.iter().position(|v| *v == me) {
-        Some(i) => Replica::new(i as NodeId, key.clone(), chain.validators.clone(), genesis, cfg),
-        None => Replica::observer(chain.validators.clone(), genesis, cfg),
+        Some(i) => Replica::weighted(i as NodeId, key.clone(), committee(chain), genesis, cfg),
+        None => Replica::observer(committee(chain), genesis, cfg),
     }
 }
 
@@ -138,6 +155,7 @@ impl Node {
             chain,
             mempool: Vec::new(),
             in_pool: Default::default(),
+            per_sender: Default::default(),
             future: Vec::new(),
             app_hashes: Vec::new(),
             outcomes: Vec::new(),
@@ -190,8 +208,17 @@ impl Node {
     /// newly admitted (the caller should gossip it on).
     pub fn submit_tx(&mut self, tx: Tx) -> bool {
         let id = tx_hash(&tx);
-        if self.in_pool.contains(&id) || self.chain.check_tx(&tx).is_err() {
+        if self.mempool.len() >= MAX_MEMPOOL || self.in_pool.contains(&id) || self.chain.check_tx(&tx).is_err() {
             return false;
+        }
+        if let Tx::User(t) = &tx {
+            let state = &self.chain.state;
+            let nonce = state.account_id(&t.signer).map_or(0, |a| state.accounts[a as usize].nonce);
+            let pending = self.per_sender.get(&t.signer).copied().unwrap_or(0);
+            if t.nonce > nonce.saturating_add(MAX_NONCE_AHEAD) || pending >= MAX_PENDING_PER_SENDER {
+                return false;
+            }
+            self.per_sender.insert(t.signer, pending + 1);
         }
         self.in_pool.insert(id);
         self.mempool.push((id, tx));
@@ -206,10 +233,14 @@ impl Node {
     fn refill(&mut self, now_ms: u64) {
         // Drop what can no longer execute, then hand the replica a fresh
         // batch if it has none.
-        let (chain, in_pool) = (&self.chain, &mut self.in_pool);
+        let (chain, in_pool, per_sender) = (&self.chain, &mut self.in_pool, &mut self.per_sender);
         self.mempool.retain(|(id, tx)| {
             let keep = match tx {
-                Tx::User(_) => chain.check_tx(tx).is_ok(),
+                // The signature was checked on admission; only the nonce can
+                // go stale.
+                Tx::User(t) => {
+                    chain.state.account_id(&t.signer).is_some_and(|a| chain.state.accounts[a as usize].nonce < t.nonce)
+                }
                 Tx::System(mee_chain::SystemTx::BridgeDeposit { deposit_id, .. }) => {
                     *deposit_id >= chain.next_deposit_id
                 }
@@ -223,6 +254,14 @@ impl Node {
             };
             if !keep {
                 in_pool.remove(id);
+                if let Tx::User(t) = tx
+                    && let Some(n) = per_sender.get_mut(&t.signer)
+                {
+                    *n -= 1;
+                    if *n == 0 {
+                        per_sender.remove(&t.signer);
+                    }
+                }
             }
             keep
         });
@@ -357,7 +396,7 @@ impl Node {
             Some((e, b)) if *e == self.epoch => b.hash(),
             _ => self.epoch_genesis,
         };
-        if !verify_committed_segment(&self.chain.validators, &self.epoch_genesis, &prev, &resp.blocks, &resp.proof) {
+        if !verify_committed_segment(&committee(&self.chain), &self.epoch_genesis, &prev, &resp.blocks, &resp.proof) {
             return Err(SyncError::BadProof);
         }
         for b in resp.blocks {
@@ -447,6 +486,12 @@ impl Node {
             return Vec::new();
         }
         if env.epoch < self.epoch {
+            return Vec::new();
+        }
+        if let Message::Propose { block, .. } = &env.msg
+            && let Ok(p) = Payload::try_from_slice(&block.payload)
+            && p.timestamp_ms > now_ms as i64 + MAX_CLOCK_DRIFT_MS
+        {
             return Vec::new();
         }
         let from = self.index_of(&env.from);

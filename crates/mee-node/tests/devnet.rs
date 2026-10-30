@@ -198,6 +198,15 @@ impl Devnet {
         self.broadcast_tx(Tx::System(SystemTx::BridgeDeposit { deposit_id: id, owner, asset, amount, attestations }));
     }
 
+    /// Node `i`'s key opens an account and registers as a validator
+    /// candidate.
+    fn register(&mut self, i: usize) {
+        let k = self.keys[i].clone();
+        self.deposit(&k, ASSET_QUOTE, 1);
+        self.run(300);
+        self.user_tx(&k, Action::RegisterValidator);
+    }
+
     fn live(&self) -> impl Iterator<Item = &Node> {
         self.nodes.iter().enumerate().filter(|(i, _)| !self.crashed.contains(i)).map(|(_, n)| n)
     }
@@ -339,9 +348,12 @@ fn stake_rotates_validators_across_epochs() {
     assert!(!net.nodes[4].replica.is_validator());
     let whale = SigningKey::from_bytes(&[9; 32]);
     net.deposit(&whale, ASSET_STAKE, 1_000);
+    net.register(4);
     net.run(500);
     let newcomer = net.nodes[4].me;
-    net.user_tx(&whale, Action::Delegate { validator: newcomer, amount: 500 });
+    // Weight 11 vs 10 for each genesis validator: it displaces one of them
+    // without holding a third of the weight on its own.
+    net.user_tx(&whale, Action::Delegate { validator: newcomer, amount: 11 });
     net.run(3_000);
 
     let heights = net.assert_agreement();
@@ -354,7 +366,8 @@ fn stake_rotates_validators_across_epochs() {
     assert!(net.nodes.iter().all(|n| n.epoch == 1), "{epochs:?}");
     assert!(net.nodes[4].replica.is_validator());
     let out = net.nodes[1].outcomes.iter().find_map(|o| o.validator_set.clone()).expect("rotation recorded");
-    assert_eq!(out, (1, set.clone()));
+    assert_eq!(out, (1, net.nodes[0].chain.committee()));
+    assert!(out.1.contains(&(newcomer, 11)));
     let dropped = net.nodes.iter().position(|n| !set.contains(&n.me)).unwrap();
     assert!(!net.nodes[dropped].replica.is_validator(), "the displaced validator now observes");
 
@@ -386,9 +399,10 @@ fn late_joiner_catches_up_by_verified_sync() {
     let mut net = Devnet::build(5, 4, vec![4], None, staking);
     let whale = SigningKey::from_bytes(&[9; 32]);
     net.deposit(&whale, ASSET_STAKE, 1_000);
+    net.register(4);
     net.run(300);
     let newcomer = net.nodes[4].me;
-    net.user_tx(&whale, Action::Delegate { validator: newcomer, amount: 500 });
+    net.user_tx(&whale, Action::Delegate { validator: newcomer, amount: 11 });
     net.run(6_000);
     let target = net.nodes[0].height();
     // The offline node is in the new set, so after the boundary the network
@@ -448,4 +462,48 @@ fn whole_network_restart_resumes_from_disk() {
     let heights = net.assert_agreement();
     assert!(heights as u64 > before + 20, "progress after a full restart: {heights} vs {before}");
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn proposals_from_the_future_get_no_votes() {
+    let net = Devnet::new(vec![]);
+    let (g, cfg) = (net.genesis.clone(), net.cfg);
+    // Node 1 leads round 1; its clock is 100 s ahead.
+    let mut leader = Node::new(net.keys[1].clone(), g.clone(), cfg);
+    let prop = leader
+        .start(100_000)
+        .into_iter()
+        .find_map(|o| match o {
+            NetOut::Broadcast(e) if matches!(e.msg, mee_consensus::Message::Propose { .. }) => Some(e),
+            _ => None,
+        })
+        .expect("leader proposes");
+    let votes = |outs: Vec<NetOut>| {
+        outs.iter().any(|o| matches!(o, NetOut::Send(_, e) if matches!(e.msg, mee_consensus::Message::Vote(_))))
+    };
+    let mut honest = Node::new(net.keys[2].clone(), g.clone(), cfg);
+    honest.start(0);
+    assert!(!votes(honest.on_message(prop.clone(), 0)), "100 s in the future: no vote");
+    let mut close = Node::new(net.keys[3].clone(), g, cfg);
+    close.start(99_000);
+    assert!(votes(close.on_message(prop, 99_000)), "within the drift bound: votes");
+}
+
+#[test]
+fn mempool_bounds_pending_transactions_per_sender() {
+    let mut net = Devnet::new(vec![]);
+    let a = SigningKey::from_bytes(&[2; 32]);
+    net.deposit(&a, ASSET_QUOTE, 1_000);
+    net.run(500);
+    let node = &mut net.nodes[0];
+    let tx = |nonce| {
+        Tx::User(SignedTx::sign(&a, CHAIN, nonce, Action::Withdraw { asset: 0, amount: 1, destination: [0; 32] }))
+    };
+    assert!(!node.submit_tx(tx(mee_node::MAX_NONCE_AHEAD + 1)), "too far ahead");
+    for n in 1..=mee_node::MAX_PENDING_PER_SENDER as u64 {
+        assert!(node.submit_tx(tx(n)));
+    }
+    assert!(!node.submit_tx(tx(1)), "duplicate");
+    let other = Tx::User(SignedTx::sign(&a, CHAIN, 1, Action::Withdraw { asset: 0, amount: 2, destination: [0; 32] }));
+    assert!(!node.submit_tx(other), "per-sender cap");
 }
