@@ -10,5 +10,8 @@ pub mod chain;
 pub mod crypto;
 pub mod tx;
 
-pub use chain::{BlockError, BlockOutcome, Chain, Genesis, LaunchMarkets, Listing, TxError, lot_for};
+pub use chain::{
+    AccountProof, BlockError, BlockOutcome, Chain, Genesis, LaunchMarkets, Listing, TxError, lot_for,
+    verify_account_proof,
+};
 pub use tx::*;

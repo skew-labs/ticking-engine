@@ -14,6 +14,8 @@ ed25519-dalek.workspace = true
 rustc-hash.workspace = true
 sha2.workspace = true
 
+[dev-dependencies]
+
 [[bench]]
 name = "chain"
 harness = false

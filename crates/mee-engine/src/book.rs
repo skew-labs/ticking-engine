@@ -44,6 +44,8 @@ pub struct Book {
     free: Vec<u32>,
     /// Lookup only; never iterated, so state transitions stay deterministic.
     index: FxHashMap<OrderId, u32>,
+    /// Multiset hash of resting orders, kept current on every change.
+    digest: crate::commit::MultisetHash,
 }
 
 impl Book {
@@ -76,6 +78,10 @@ impl Book {
         }
     }
 
+    pub fn digest(&self) -> crate::commit::MultisetHash {
+        self.digest
+    }
+
     pub fn get(&self, id: OrderId) -> Option<&Order> {
         self.index.get(&id).map(|&i| &self.slab[i as usize].order)
     }
@@ -83,6 +89,7 @@ impl Book {
     /// Appends to the back of its price level.
     pub fn insert(&mut self, order: Order) {
         debug_assert!(!self.index.contains_key(&order.id));
+        self.digest.add(&crate::commit::order_hash(&order));
         let node = Node { order, prev: NIL, next: NIL };
         let idx = match self.free.pop() {
             Some(i) => {
@@ -117,6 +124,7 @@ impl Book {
     pub fn remove(&mut self, id: OrderId) -> Option<Order> {
         let idx = self.index.remove(&id)?;
         let Node { order, prev, next } = self.slab[idx as usize].clone();
+        self.digest.sub(&crate::commit::order_hash(&order));
         if prev != NIL {
             self.slab[prev as usize].next = next;
         }
@@ -144,7 +152,9 @@ impl Book {
     pub fn reduce(&mut self, id: OrderId, qty: u64) {
         let idx = self.index[&id];
         let order = &mut self.slab[idx as usize].order;
+        self.digest.sub(&crate::commit::order_hash(order));
         order.remaining -= qty;
+        self.digest.add(&crate::commit::order_hash(order));
         let (side, price) = (order.side, order.price);
         self.levels_mut(side).get_mut(&price).expect("level of live order").total -= qty;
     }

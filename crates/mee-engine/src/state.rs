@@ -62,6 +62,9 @@ pub struct Account {
     pub balance: i64,
     /// Free stake-token balance, used to deploy DEXes.
     pub stake_balance: u64,
+    /// Highest transaction nonce used (replay protection, kept here so it is
+    /// part of the committed state).
+    pub nonce: u64,
     /// Sorted by DEX id.
     pub margins: Vec<(DexId, Margin)>,
 }
@@ -128,13 +131,93 @@ pub struct Dex {
     pub attested_oracle: bool,
     /// Accounts holding a margin here, in join order (for deterministic sweeps).
     pub members: Vec<AccountId>,
+    /// Hash chain over `members`, so the list is committed in O(1) per join.
+    pub members_hash: [u8; 32],
+}
+
+/// Account storage that remembers which accounts were mutated since the last
+/// state commit: every mutable access goes through `IndexMut` / `get_mut`.
+#[derive(Clone, Debug, Default)]
+pub struct Accounts {
+    v: Vec<Account>,
+    dirty: Vec<AccountId>,
+    is_dirty: Vec<bool>,
+}
+
+impl Accounts {
+    pub fn len(&self) -> usize {
+        self.v.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.v.is_empty()
+    }
+
+    pub fn push(&mut self, a: Account) {
+        self.v.push(a);
+        self.is_dirty.push(false);
+        self.mark(self.v.len() - 1);
+    }
+
+    pub fn get(&self, i: usize) -> Option<&Account> {
+        self.v.get(i)
+    }
+
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut Account> {
+        if i < self.v.len() {
+            self.mark(i);
+        }
+        self.v.get_mut(i)
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Account> {
+        self.v.iter()
+    }
+
+    fn mark(&mut self, i: usize) {
+        if !self.is_dirty[i] {
+            self.is_dirty[i] = true;
+            self.dirty.push(i as AccountId);
+        }
+    }
+
+    pub fn take_dirty(&mut self) -> Vec<AccountId> {
+        for &i in &self.dirty {
+            self.is_dirty[i as usize] = false;
+        }
+        std::mem::take(&mut self.dirty)
+    }
+}
+
+impl std::ops::Index<usize> for Accounts {
+    type Output = Account;
+    fn index(&self, i: usize) -> &Account {
+        &self.v[i]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Accounts {
+    fn index_mut(&mut self, i: usize) -> &mut Account {
+        self.mark(i);
+        &mut self.v[i]
+    }
+}
+
+impl<'a> IntoIterator for &'a Accounts {
+    type Item = &'a Account;
+    type IntoIter = std::slice::Iter<'a, Account>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.v.iter()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct State {
     pub params: EngineParams,
     pub now: i64,
-    pub accounts: Vec<Account>,
+    pub accounts: Accounts,
+    pub account_tree: crate::commit::MerkleTree,
+    pub last_roots: crate::commit::StateRoots,
     pub account_index: FxHashMap<Key, AccountId>,
     pub dexes: Vec<Dex>,
     pub markets: Vec<Market>,

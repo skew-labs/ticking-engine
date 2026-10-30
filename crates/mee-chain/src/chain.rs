@@ -99,12 +99,32 @@ pub enum BlockError {
     TimeWentBackwards,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountProof {
+    pub id: AccountId,
+    pub leaf: Hash,
+    pub path: Vec<Hash>,
+    pub roots: mee_engine::commit::StateRoots,
+    pub globals: Hash,
+}
+
+/// Checks an account proof against a chain `state_root`. `leaf` must be the
+/// hash of the account the client expects (`mee_engine::commit::account_leaf`).
+pub fn verify_account_proof(state_root: &Hash, p: &AccountProof) -> bool {
+    let r = &p.roots;
+    mee_engine::commit::verify_proof(&r.accounts, p.id as usize, &p.leaf, &p.path)
+        && mee_engine::commit::StateRoots::combine(&r.accounts, &r.markets, &r.dexes, &r.globals) == r.root
+        && crypto::sha256(&[b"MEE/chain-state", &r.root, &p.globals]) == *state_root
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BlockOutcome {
     /// Per transaction in execution order (system, cancels, post-only, rest).
     pub results: Vec<Result<(), TxError>>,
     pub events: Vec<Event>,
     pub withdrawals: Vec<WithdrawalReceipt>,
+    /// State root after this block; validators sign it for light clients.
+    pub state_root: Hash,
     pub app_hash: Hash,
 }
 
@@ -116,9 +136,11 @@ pub struct Chain {
     pub height: u64,
     pub timestamp_ms: i64,
     pub app_hash: Hash,
-    /// Highest nonce used per signer. Lookup only, so iteration order never
-    /// leaks into state.
-    pub nonces: FxHashMap<Pubkey, u64>,
+    /// Engine state root after the last block (see `prove_account`).
+    pub state_root: Hash,
+    /// Hash chains over append-only chain data, so it is committed cheaply.
+    pub withdrawals_hash: Hash,
+    pub listings_hash: Hash,
     pub next_deposit_id: u64,
     pub next_withdrawal_id: u64,
     pub governance_nonce: u64,
@@ -143,7 +165,9 @@ impl Chain {
             height: 0,
             timestamp_ms: g.timestamp_ms,
             app_hash: crypto::sha256(&[b"MEE/genesis", &g.chain_id.to_le_bytes()]),
-            nonces: FxHashMap::default(),
+            state_root: [0; 32],
+            withdrawals_hash: [0; 32],
+            listings_hash: [0; 32],
             next_deposit_id: 0,
             next_withdrawal_id: 0,
             governance_nonce: 0,
@@ -201,10 +225,13 @@ impl Chain {
     }
 
     fn check_nonce(&self, tx: &Tx) -> Result<(), TxError> {
-        if let Tx::User(t) = tx
-            && t.nonce <= self.nonces.get(&t.signer).copied().unwrap_or(0)
-        {
-            return Err(TxError::StaleNonce);
+        if let Tx::User(t) = tx {
+            // Nonces live in the account (so they are committed); a key with
+            // no account can't act, and its transactions consume nothing.
+            let a = self.state.account_id(&t.signer).ok_or(TxError::UnknownAccount)?;
+            if t.nonce <= self.state.accounts[a as usize].nonce {
+                return Err(TxError::StaleNonce);
+            }
         }
         Ok(())
     }
@@ -286,7 +313,11 @@ impl Chain {
             out.results.push(r);
         }
 
+        let roots = self.state.commit();
+        self.state_root = crypto::sha256(&[b"MEE/chain-state", &roots.root, &self.globals_hash()]);
+        out.state_root = self.state_root;
         let mut h = sha2_chain(&self.app_hash, block);
+        h = crypto::sha256(&[&h, &self.state_root]);
         for r in &out.results {
             h = crypto::sha256(&[&h, format!("{r:?}").as_bytes()]);
         }
@@ -360,6 +391,12 @@ impl Chain {
                 let market =
                     self.state.add_protocol_market(dex, cfg, creator, c.creator_fee_share_bps, &mut out.events)?;
                 self.listings.insert(*launch_id, Listing { market, lot_atoms });
+                self.listings_hash = crypto::sha256(&[
+                    &self.listings_hash,
+                    &launch_id.to_le_bytes(),
+                    &market.to_le_bytes(),
+                    &lot_atoms.to_le_bytes(),
+                ]);
                 Ok(())
             }
             Tx::System(SystemTx::LaunchOracle { solana_slot, updates, .. }) => {
@@ -396,10 +433,37 @@ impl Chain {
             Tx::User(t) => {
                 // A valid signature with a fresh nonce consumes the nonce even
                 // if the action fails, so it can never be replayed.
-                self.nonces.insert(t.signer, t.nonce);
+                let a = self.state.account_id(&t.signer).expect("checked by check_nonce");
+                self.state.accounts[a as usize].nonce = t.nonce;
                 self.execute_action(&t.signer, &t.action, out)
             }
         }
+    }
+
+    /// Chain-level values outside the engine state.
+    pub fn globals_hash(&self) -> Hash {
+        crypto::sha256(&[
+            b"MEE/chain-globals",
+            &self.height.to_le_bytes(),
+            &self.timestamp_ms.to_le_bytes(),
+            &self.next_deposit_id.to_le_bytes(),
+            &self.next_withdrawal_id.to_le_bytes(),
+            &self.governance_nonce.to_le_bytes(),
+            &self.last_oracle_slot.to_le_bytes(),
+            &self.launch_dex.map_or(u32::MAX, |d| d).to_le_bytes(),
+            &self.withdrawals_hash,
+            &self.listings_hash,
+        ])
+    }
+
+    /// Proof that `owner`'s account is in the state committed by the last
+    /// block. Check it with `verify_account_proof` against a `state_root`
+    /// that a validator quorum signed (`crypto::state_root_message`).
+    pub fn prove_account(&self, owner: &Pubkey) -> Option<AccountProof> {
+        let id = self.state.account_id(owner)?;
+        let (leaf, path) = self.state.prove_account(id);
+        let roots = self.state.last_roots;
+        Some(AccountProof { id, leaf, path, roots, globals: self.globals_hash() })
     }
 
     /// Open interest cap in lots: `oi_cap_ratio` × pool quote depth.
@@ -467,6 +531,8 @@ impl Chain {
                 };
                 self.next_withdrawal_id += 1;
                 self.withdrawals.push(receipt);
+                self.withdrawals_hash =
+                    crypto::sha256(&[&self.withdrawals_hash, &borsh::to_vec(&receipt).expect("borsh")]);
                 out.withdrawals.push(receipt);
                 Ok(())
             }

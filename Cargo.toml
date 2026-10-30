@@ -13,7 +13,7 @@ bytemuck = { version = "1.25", features = ["derive", "min_const_generics", "exte
 borsh = { version = "1.5", features = ["derive"] }
 rustc-hash = "2"
 ed25519-dalek = { version = "2.2", features = ["rand_core", "batch"] }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["compress"] }
 
 [profile.release]
 overflow-checks = true

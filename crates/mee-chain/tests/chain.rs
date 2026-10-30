@@ -148,6 +148,11 @@ fn signatures_and_nonces() {
 
     let out = net.block(vec![Tx::User(forged)]);
     assert_eq!(out.results, vec![Err(TxError::BadSignature)]);
+    // A key without an account can't act (and consumes nothing).
+    let out = net.block(vec![Tx::User(t.clone())]);
+    assert_eq!(out.results, vec![Err(TxError::UnknownAccount)]);
+    let dep = net.deposit_tx(&k, ASSET_QUOTE, 1);
+    net.ok(vec![dep]);
     let out = net.block(vec![Tx::User(t.clone())]);
     assert_eq!(
         out.results,
@@ -242,6 +247,35 @@ fn cancels_and_post_only_run_first() {
     let txs = vec![net.tx(&b, order(0, 0, 2, PRICE + 5, 3)), net.tx(&a, order(0, 1, 1, PRICE + 5, 3))];
     let out = net.ok(txs);
     assert!(out.events.iter().any(|e| matches!(e, Event::Fill { size: 3, .. })));
+}
+
+#[test]
+fn account_proofs_verify_against_the_state_root() {
+    let (mut net, _dep, a, b) = setup();
+    let txs = vec![net.tx(&a, order(0, 1, 0, PRICE, 10)), net.tx(&b, order(0, 0, 2, PRICE, 4))];
+    let out = net.ok(txs);
+    let root = out.state_root;
+    let pa = net.chain.prove_account(&crypto::pubkey(&a)).unwrap();
+    assert!(verify_account_proof(&root, &pa));
+    // The proven leaf is the account the client expects.
+    let acct = &net.chain.state.accounts[pa.id as usize];
+    assert_eq!(pa.leaf, mee_engine::commit::account_leaf(pa.id, acct));
+    assert_eq!(acct.margin(0).unwrap().position(0).base, -4);
+    // Any tampering breaks it.
+    let mut bad = pa.clone();
+    bad.leaf[0] ^= 1;
+    assert!(!verify_account_proof(&root, &bad));
+    let mut bad = pa.clone();
+    bad.globals[0] ^= 1;
+    assert!(!verify_account_proof(&root, &bad));
+    // A proof for one block doesn't verify against the next root.
+    let sweep = net.tx(&b, Action::SweepProtocolFees { dex: 0 });
+    let out = net.ok(vec![sweep]);
+    assert!(!verify_account_proof(&out.state_root, &pa));
+    // Validators sign the root for light clients.
+    let msg = crypto::state_root_message(CHAIN, net.chain.height, &out.state_root);
+    let sig = crypto::sign(&net.validators[0], &msg);
+    assert!(crypto::verify(&crypto::pubkey(&net.validators[0]), &msg, &sig));
 }
 
 #[test]

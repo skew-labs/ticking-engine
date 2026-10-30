@@ -80,6 +80,11 @@ pub fn launch_oracle_message(chain_id: u64, slot: u64, updates: &[u8]) -> Hash {
     sha256(&[b"MEE/launch-oracle", &chain_id.to_le_bytes(), &slot.to_le_bytes(), updates])
 }
 
+/// What validators sign so light clients can trust a state root.
+pub fn state_root_message(chain_id: u64, height: u64, state_root: &Hash) -> Hash {
+    sha256(&[b"MEE/state-root", &chain_id.to_le_bytes(), &height.to_le_bytes(), state_root])
+}
+
 /// What validators sign for a governance action (`body` is its encoding).
 pub fn governance_message(chain_id: u64, nonce: u64, body: &[u8]) -> Hash {
     sha256(&[b"MEE/governance", &chain_id.to_le_bytes(), &nonce.to_le_bytes(), body])

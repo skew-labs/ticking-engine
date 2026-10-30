@@ -281,7 +281,9 @@ impl State {
     fn join(&mut self, a: AccountId, dex: DexId) {
         let (_, created) = self.accounts[a as usize].margin_mut(dex);
         if created {
-            self.dexes[dex as usize].members.push(a);
+            let d = &mut self.dexes[dex as usize];
+            d.members.push(a);
+            d.members_hash = crate::commit::sha256(&[&d.members_hash, &a.to_le_bytes()]);
         }
     }
 
@@ -1091,6 +1093,7 @@ impl State {
         let snap_oi = self.markets[m as usize].open_interest;
         let snap_insurance = self.dexes[dex as usize].insurance;
         let members_len = self.dexes[dex as usize].members.len();
+        let members_hash = self.dexes[dex as usize].members_hash;
 
         let result = (|| -> Result<i64> {
             self.join(liquidator, dex);
@@ -1131,6 +1134,7 @@ impl State {
                 self.markets[m as usize].open_interest = snap_oi;
                 self.dexes[dex as usize].insurance = snap_insurance;
                 self.dexes[dex as usize].members.truncate(members_len);
+                self.dexes[dex as usize].members_hash = members_hash;
                 return Err(e);
             }
         };

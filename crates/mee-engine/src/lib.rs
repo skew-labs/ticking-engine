@@ -7,6 +7,7 @@
 //! DEXes and markets. Deterministic: hash maps are only used for lookups.
 
 pub mod book;
+pub mod commit;
 pub mod engine;
 pub mod state;
 
