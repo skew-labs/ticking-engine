@@ -96,6 +96,13 @@ pub struct Market {
     pub open_interest: u64,
     pub last_trade_price: u64,
     pub settlement_price: u64,
+    /// Launchpad markets: the token's creator earns the fee share instead of
+    /// the DEX deployer, credited straight to their balance.
+    pub creator: Option<AccountId>,
+    pub creator_fee_share_bps: u64,
+    /// Σ premium_bps × seconds since the last funding payment (funding TWAP).
+    pub premium_acc: i128,
+    pub premium_ts: i64,
     pub book: Book,
 }
 
@@ -116,6 +123,9 @@ pub struct Dex {
     pub socialized_loss: i64,
     pub unrecovered_loss: i64,
     pub markets: Vec<MarketId>,
+    /// Prices come from validator attestations (protocol-run DEX), not from
+    /// a deployer key.
+    pub attested_oracle: bool,
     /// Accounts holding a margin here, in join order (for deterministic sweeps).
     pub members: Vec<AccountId>,
 }

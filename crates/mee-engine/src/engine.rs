@@ -109,7 +109,19 @@ pub enum Event {
         amount: u64,
         frozen: bool,
     },
+    /// Auto-deleveraging: `counterparty` closed `size` against a bankrupt
+    /// `target` at the bankruptcy price.
+    Adl {
+        market: MarketId,
+        target: AccountId,
+        counterparty: AccountId,
+        size: u64,
+        price: u64,
+    },
 }
+
+/// Owner key of the protocol account that runs protocol DEXes.
+pub const PROTOCOL_KEY: Key = [0xFE; 32];
 
 pub type Events = Vec<Event>;
 
@@ -309,13 +321,36 @@ impl State {
         self.realize_if_flat(seller, dex, m)
     }
 
-    fn charge_fee(&mut self, a: AccountId, dex: DexId, protocol: i128, deployer: i128) -> Result<i64> {
+    /// Fee share of a market and who receives it (a launch creator, or the
+    /// DEX deployer when `None`).
+    fn fee_share(&self, m: MarketId) -> (u64, Option<AccountId>) {
+        let market = &self.markets[m as usize];
+        match market.creator {
+            Some(c) => (market.creator_fee_share_bps, Some(c)),
+            None => (self.dexes[market.dex as usize].fee_share_bps, None),
+        }
+    }
+
+    fn charge_fee(
+        &mut self,
+        a: AccountId,
+        dex: DexId,
+        protocol: i128,
+        deployer: i128,
+        creator: Option<AccountId>,
+    ) -> Result<i64> {
         let total = math::add(protocol, deployer)?;
         let (mg, _) = self.accounts[a as usize].margin_mut(dex);
         mg.collateral = math::to_i64(math::sub(mg.collateral as i128, total)?)?;
         let d = &mut self.dexes[dex as usize];
         d.protocol_fees = math::to_i64(math::add(d.protocol_fees as i128, protocol)?)?;
-        d.deployer_fees = math::to_i64(math::add(d.deployer_fees as i128, deployer)?)?;
+        match creator {
+            Some(c) => {
+                let acct = &mut self.accounts[c as usize];
+                acct.balance = math::to_i64(math::add(acct.balance as i128, deployer)?)?;
+            }
+            None => d.deployer_fees = math::to_i64(math::add(d.deployer_fees as i128, deployer)?)?,
+        }
         math::to_i64(total)
     }
 
@@ -482,6 +517,17 @@ impl State {
 
     pub fn add_market(&mut self, a: AccountId, dex: DexId, cfg: MarketArgs, out: &mut Events) -> Result<MarketId> {
         self.deployer_dex(a, dex)?;
+        self.insert_market(dex, cfg, None, 0, out)
+    }
+
+    fn insert_market(
+        &mut self,
+        dex: DexId,
+        cfg: MarketArgs,
+        creator: Option<AccountId>,
+        creator_fee_share_bps: u64,
+        out: &mut Events,
+    ) -> Result<MarketId> {
         let p = &self.params;
         let valid = cfg.tick_size > 0
             && cfg.min_base_lots > 0
@@ -493,7 +539,8 @@ impl State {
             && cfg.oi_cap > 0
             && cfg.initial_price > 0
             && cfg.funding_interval > 0
-            && cfg.max_funding_bps <= cfg.maintenance_margin_bps;
+            && cfg.max_funding_bps <= cfg.maintenance_margin_bps
+            && creator_fee_share_bps <= p.max_fee_share_bps;
         if !valid {
             return Err(Error::InvalidMarketParams);
         }
@@ -510,6 +557,10 @@ impl State {
             open_interest: 0,
             last_trade_price: 0,
             settlement_price: 0,
+            creator,
+            creator_fee_share_bps,
+            premium_acc: 0,
+            premium_ts: self.now,
             book: Default::default(),
         });
         self.dexes[dex as usize].markets.push(id);
@@ -517,14 +568,75 @@ impl State {
         Ok(id)
     }
 
+    /// A DEX run by the protocol itself: no stake, prices from validator
+    /// attestations. The launchpad lists graduated tokens here.
+    pub fn create_protocol_dex(&mut self, name: [u8; 16], out: &mut Events) -> DexId {
+        let deployer = self.account_or_create(&PROTOCOL_KEY);
+        let id = self.dexes.len() as DexId;
+        self.dexes.push(Dex {
+            id,
+            name,
+            deployer,
+            status: DEX_ACTIVE,
+            deployed_ts: self.now,
+            attested_oracle: true,
+            ..Dex::default()
+        });
+        out.push(Event::DexDeployed { dex: id, deployer, stake: 0 });
+        id
+    }
+
+    /// Lists a market on a protocol DEX with a creator who earns the fee share.
+    pub fn add_protocol_market(
+        &mut self,
+        dex: DexId,
+        cfg: MarketArgs,
+        creator: AccountId,
+        creator_fee_share_bps: u64,
+        out: &mut Events,
+    ) -> Result<MarketId> {
+        let d = self.dex(dex)?;
+        if !d.attested_oracle || d.status != DEX_ACTIVE {
+            return Err(Error::DexNotActive);
+        }
+        self.account(creator)?;
+        self.insert_market(dex, cfg, Some(creator), creator_fee_share_bps, out)
+    }
+
+    /// Validator-attested prices for a protocol DEX.
+    pub fn set_oracle_attested(&mut self, dex: DexId, prices: &[(MarketId, u64)]) -> Result<()> {
+        if !self.dex(dex)?.attested_oracle {
+            return Err(Error::NotOrderOwner);
+        }
+        self.apply_oracle(dex, prices)
+    }
+
+    /// Open interest cap of a protocol market, scaled by the chain to the
+    /// token's spot liquidity.
+    pub fn set_oi_cap_attested(&mut self, m: MarketId, cap: u64) -> Result<()> {
+        let market = self.market(m)?;
+        if !self.dex(market.dex)?.attested_oracle {
+            return Err(Error::NotOrderOwner);
+        }
+        if cap == 0 {
+            return Err(Error::InvalidMarketParams);
+        }
+        self.markets[m as usize].cfg.oi_cap = cap;
+        Ok(())
+    }
+
     /// The DEX oracle push. All prices are validated before any is applied.
     pub fn set_oracle(&mut self, signer: &Key, dex: DexId, prices: &[(MarketId, u64)]) -> Result<()> {
         let d = self.dex(dex)?;
-        if d.status != DEX_ACTIVE {
-            return Err(Error::DexNotActive);
-        }
-        if &d.oracle_authority != signer {
+        if d.attested_oracle || &d.oracle_authority != signer {
             return Err(Error::NotOrderOwner);
+        }
+        self.apply_oracle(dex, prices)
+    }
+
+    fn apply_oracle(&mut self, dex: DexId, prices: &[(MarketId, u64)]) -> Result<()> {
+        if self.dex(dex)?.status != DEX_ACTIVE {
+            return Err(Error::DexNotActive);
         }
         for &(m, price) in prices {
             let market = self.active_market(m)?;
@@ -760,7 +872,7 @@ impl State {
         }
         let rests = remaining > 0 && !req.reduce_only && req.kind != OrderKind::ImmediateOrCancel && !capped;
 
-        let share = self.dexes[dex as usize].fee_share_bps;
+        let (share, creator) = self.fee_share(m);
         let mut p = pos0;
         settle_position_funding(market, &mut p)?;
         let mut taker_fees: i128 = 0;
@@ -841,9 +953,9 @@ impl State {
                     self.release_open(maker, dex, m, opposite, size);
                     let notional = math::mul(size as i128, order.price as i128)?;
                     let (pf, df) = fees(notional, self.params.taker_fee_bps, share)?;
-                    let taker_fee = self.charge_fee(a, dex, pf, df)?;
+                    let taker_fee = self.charge_fee(a, dex, pf, df, creator)?;
                     let (pf, df) = fees(notional, self.params.maker_fee_bps, share)?;
-                    let maker_fee = self.charge_fee(maker, dex, pf, df)?;
+                    let maker_fee = self.charge_fee(maker, dex, pf, df, creator)?;
                     let book = &mut self.markets[m as usize].book;
                     if size == order.remaining {
                         book.remove(order.id);
@@ -957,12 +1069,18 @@ impl State {
             return Err(Error::OracleStale);
         }
         let dex = market.dex;
-        if !self.health(target, dex, None)?.liquidatable() {
+        let h = self.health(target, dex, None)?;
+        if !h.liquidatable() {
             return Err(Error::NotLiquidatable);
         }
         let base = self.accounts[target as usize].margin(dex).map_or(0, |mg| mg.position(m).base);
         if base == 0 {
             return Err(Error::NoPosition);
+        }
+        // Bankrupt beyond what the insurance fund can cover: deleverage the
+        // most profitable opposite positions instead of socializing the loss.
+        if h.equity < 0 && (self.dexes[dex as usize].insurance.max(0) as i128) < -h.equity {
+            return self.auto_deleverage(target, m, out);
         }
         let size = if max_size == 0 { base.unsigned_abs() } else { base.unsigned_abs().min(max_size) };
         let price = self.mark_price(market);
@@ -1021,6 +1139,60 @@ impl State {
         out.push(Event::Liquidated { market: m, liquidator, liquidatee: target, size, price, penalty });
         self.resolve_bad_debt(target, dex, out)?;
         Ok(size)
+    }
+
+    /// Closes `target`'s whole position in `m` against opposite positions,
+    /// most profitable first (unrealized PnL per unit of collateral), at the
+    /// bankruptcy price: the price at which `target` ends with zero equity.
+    fn auto_deleverage(&mut self, target: AccountId, m: MarketId, out: &mut Events) -> Result<u64> {
+        let dex = self.markets[m as usize].dex;
+        self.cancel_all(target, m, CancelReason::Liquidation, out)?;
+        self.settle_funding(target, dex, m)?;
+        let p = self.accounts[target as usize].margin(dex).expect("member").position(m);
+        let mark = self.mark_price(&self.markets[m as usize]) as i128;
+        let equity = self.health(target, dex, None)?.equity;
+        let others = equity - (p.base as i128 * mark + p.quote);
+        // base·pb + quote + others = 0, rounded so the target keeps >= 0.
+        let num = -(p.quote + others);
+        let pb =
+            if p.base > 0 { math::div_ceil(num, p.base as i128) } else { math::div_floor(-num, -(p.base as i128)) };
+        let pb = pb.clamp(1, u64::MAX as i128) as u64;
+
+        let market = &self.markets[m as usize];
+        let mut cands: Vec<(i128, AccountId, u64)> = Vec::new();
+        for &x in &self.dexes[dex as usize].members {
+            if x == target {
+                continue;
+            }
+            let mg = self.accounts[x as usize].margin(dex).expect("member");
+            let cp = mg.position(m);
+            if cp.base == 0 || (cp.base > 0) == (p.base > 0) {
+                continue;
+            }
+            let pnl = cp.base as i128 * mark + cp.quote - pending_funding(market, &cp)?;
+            let score = math::mul(pnl, BPS)? / (mg.collateral.max(1) as i128);
+            cands.push((score, x, cp.base.unsigned_abs()));
+        }
+        cands.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+        let mut remaining = p.base.unsigned_abs();
+        for (_, cp, cp_size) in cands {
+            if remaining == 0 {
+                break;
+            }
+            let q = remaining.min(cp_size);
+            self.settle_funding(cp, dex, m)?;
+            if p.base > 0 {
+                self.trade(m, cp, target, q, pb)?;
+            } else {
+                self.trade(m, target, cp, q, pb)?;
+            }
+            out.push(Event::Adl { market: m, target, counterparty: cp, size: q, price: pb });
+            remaining -= q;
+        }
+        debug_assert_eq!(remaining, 0, "open interest is balanced, so the other side covers the position");
+        self.resolve_bad_debt(target, dex, out)?;
+        Ok(p.base.unsigned_abs() - remaining)
     }
 
     /// Accounts in `dex` currently below maintenance margin (for keepers).
@@ -1085,20 +1257,29 @@ impl State {
         self.now = now.max(self.now);
         for i in 0..self.markets.len() {
             let m = &self.markets[i];
-            if m.status != MARKET_ACTIVE
-                || self.now < m.last_funding_ts.saturating_add(m.cfg.funding_interval)
-                || !self.oracle_fresh(m)
-            {
+            if m.status != MARKET_ACTIVE {
                 continue;
             }
+            let fresh = self.oracle_fresh(m);
             let oracle = m.oracle_price as i128;
-            let mark = self.mark_price(m) as i128;
             let cap = m.cfg.max_funding_bps as i128;
-            let rate = (math::mul(mark - oracle, BPS)? / oracle).clamp(-cap, cap);
-            let delta = math::mul(math::mul(oracle, rate)?, FUNDING_SCALE)? / BPS;
+            // Sample the premium over the time since the last block: funding
+            // pays the time-weighted average, so a single block can't game it.
+            let premium = if fresh { math::mul(self.mark_price(m) as i128 - oracle, BPS)? / oracle } else { 0 };
+            let dt = (self.now - m.premium_ts).max(0) as i128;
+            let due = self.now >= m.last_funding_ts.saturating_add(m.cfg.funding_interval) && fresh;
+            let elapsed = (self.now - m.last_funding_ts).max(1) as i128;
             let m = &mut self.markets[i];
+            m.premium_acc = math::add(m.premium_acc, math::mul(premium, dt)?)?;
+            m.premium_ts = self.now;
+            if !due {
+                continue;
+            }
+            let rate = (m.premium_acc / elapsed).clamp(-cap, cap);
+            let delta = math::mul(math::mul(oracle, rate)?, FUNDING_SCALE)? / BPS;
             m.cum_funding = math::add(m.cum_funding, delta)?;
             m.last_funding_ts = self.now;
+            m.premium_acc = 0;
             out.push(Event::Funding { market: m.id, rate_bps: rate as i64 });
         }
         Ok(())

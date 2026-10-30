@@ -211,7 +211,7 @@ fn cancel_and_cancel_all() {
 }
 
 #[test]
-fn liquidation_and_bad_debt() {
+fn bankrupt_position_is_auto_deleveraged() {
     let mut e = Env::with(EngineParams { taker_fee_bps: 0, maker_fee_bps: 0, ..params() }, market_args(), 0);
     let mm = e.trader(1, 1_000_000);
     let t = e.trader(2, 10_000);
@@ -224,14 +224,41 @@ fn liquidation_and_bad_debt() {
     assert_eq!(e.s.liquidate(liq, t, e.m, 0, &mut e.ev).unwrap_err(), EngineError::NotLiquidatable);
     assert!(e.s.liquidatable(e.dex).is_empty());
 
+    // Gap to 8_000: equity 10_000 − 20_000 = −10_000, insurance only 1_000.
     e.walk_oracle(8_000);
     assert_eq!(e.s.liquidatable(e.dex), vec![t]);
     e.s.liquidate(liq, t, e.m, 0, &mut e.ev).unwrap();
-    assert_eq!(e.pos(liq).base, 10);
+    // Bankruptcy price: 10_000 + 10·p − 100_000 = 0 → p = 9_000. The short
+    // (the only opposite position) buys back there.
+    assert_eq!(e.ev.last(), Some(&Event::Adl { market: 0, target: t, counterparty: mm, size: 10, price: 9_000 }));
+    assert_eq!((e.pos(t).base, e.pos(mm).base, e.pos(liq).base), (0, 0, 0));
     assert_eq!(e.col(t), 0);
+    assert_eq!(e.col(mm), 1_000_000 + 10_000);
     let d = &e.s.dexes[0];
-    assert_eq!((d.insurance, d.socialized_loss, d.unrecovered_loss), (0, 9_000, 0));
-    assert_eq!(e.col(mm), 1_000_000 - 4_500);
+    assert_eq!((d.insurance, d.socialized_loss, d.unrecovered_loss), (1_000, 0, 0), "nobody else pays");
+    check_invariants(&e.s, e.net_in);
+}
+
+#[test]
+fn bad_debt_at_settlement_uses_insurance_then_socializes() {
+    let mut e = Env::with(EngineParams { taker_fee_bps: 0, maker_fee_bps: 0, ..params() }, market_args(), 0);
+    let mm = e.trader(1, 1_000_000);
+    let t = e.trader(2, 10_000);
+    let other = e.trader(3, 1_000_000);
+    e.s.deposit(&key(4), 1_000).unwrap();
+    e.net_in += 1_000;
+    e.s.fund_insurance(e.s.account_id(&key(4)).unwrap(), e.dex, 1_000).unwrap();
+    e.order(mm, Side::Ask, OrderKind::Limit, PRICE, 10).unwrap();
+    e.order(t, Side::Bid, OrderKind::ImmediateOrCancel, PRICE, 10).unwrap();
+    e.walk_oracle(8_000);
+    e.s.halt_market(Some(e.deployer), e.m, 8_000, &mut e.ev).unwrap();
+    let d = &e.s.dexes[0];
+    // 9_000 owed after insurance; pro-rata shares round up by at most an atom
+    // per member, so the venue is never short.
+    assert_eq!((d.insurance, d.unrecovered_loss), (0, 0));
+    assert!((9_000..=9_002).contains(&d.socialized_loss), "{}", d.socialized_loss);
+    let (cm, co) = (e.col(mm), e.col(other));
+    assert_eq!(cm + co, 1_020_000 + 1_000_000 - d.socialized_loss);
     check_invariants(&e.s, e.net_in);
 }
 
@@ -258,7 +285,8 @@ fn failed_liquidation_restores_state() {
 
 #[test]
 fn funding_runs_in_begin_block() {
-    let mut e = Env::with(EngineParams { taker_fee_bps: 0, maker_fee_bps: 0, ..params() }, market_args(), 0);
+    let p = EngineParams { taker_fee_bps: 0, maker_fee_bps: 0, max_oracle_staleness: 10_000, ..params() };
+    let mut e = Env::with(p, market_args(), 0);
     let long = e.trader(1, 1_000_000);
     let short = e.trader(2, 1_000_000);
     let mm = e.trader(3, 1_000_000);
@@ -272,6 +300,7 @@ fn funding_runs_in_begin_block() {
     e.s.now = 3_600;
     e.s.set_oracle(&key(9_999), e.dex, &[(e.m, PRICE)]).unwrap();
     e.s.begin_block(3_600, &mut e.ev).unwrap();
+    // The premium held at +40 bps for the whole interval, so its TWAP is 40.
     assert_eq!(e.ev.last(), Some(&Event::Funding { market: 0, rate_bps: 40 }));
     let after = (e.s.health(long, e.dex, None).unwrap().equity, e.s.health(short, e.dex, None).unwrap().equity);
     // 40 bps of 10_000 per lot on 10 lots: the long pays 400, the short gets it.
@@ -478,4 +507,43 @@ fn random_actions_are_atomic_and_keep_invariants() {
         }
         assert!(ok > 1_000 && rejected > 100, "seed {seed}: ok {ok}, rejected {rejected}");
     }
+}
+
+#[test]
+fn protocol_market_pays_creator_and_takes_attested_prices() {
+    let mut e = Env::with(params(), market_args(), 0);
+    let creator = e.s.deposit(&key(500), 0).unwrap();
+    let pdex = e.s.create_protocol_dex(*b"launch\0\0\0\0\0\0\0\0\0\0", &mut e.ev);
+    let m = e.s.add_protocol_market(pdex, market_args(), creator, 10_000, &mut e.ev).unwrap();
+    // No deployer key can push prices; only the attested path.
+    assert_eq!(e.s.set_oracle(&key(9_999), pdex, &[(m, PRICE)]).unwrap_err(), EngineError::NotOrderOwner);
+    e.s.now += 1;
+    e.s.set_oracle_attested(pdex, &[(m, PRICE + 100)]).unwrap();
+    assert_eq!(e.s.set_oracle_attested(e.dex, &[(e.m, PRICE)]).unwrap_err(), EngineError::NotOrderOwner);
+    e.s.set_oi_cap_attested(m, 5).unwrap();
+
+    let a = e.s.deposit(&key(1), 1_000_000).unwrap();
+    let b = e.s.deposit(&key(2), 1_000_000).unwrap();
+    e.net_in += 2_000_000;
+    e.s.transfer_to_dex(a, pdex, 1_000_000).unwrap();
+    e.s.transfer_to_dex(b, pdex, 1_000_000).unwrap();
+    let req = |side, kind, size| OrderRequest {
+        market: m,
+        side,
+        kind,
+        price: PRICE + 100,
+        size,
+        reduce_only: false,
+        client_id: 0,
+    };
+    e.s.place_order(a, &req(Side::Ask, OrderKind::Limit, 10), &mut e.ev).unwrap();
+    assert_eq!(
+        e.s.place_order(b, &req(Side::Bid, OrderKind::ImmediateOrCancel, 6), &mut e.ev).unwrap_err(),
+        EngineError::OpenInterestCap
+    );
+    e.s.place_order(b, &req(Side::Bid, OrderKind::ImmediateOrCancel, 5), &mut e.ev).unwrap();
+    // notional 50_500: taker 26 + maker 6 protocol; creator gets the same again (100% share).
+    assert_eq!(e.s.accounts[creator as usize].balance, 26 + 6);
+    assert_eq!(e.s.dexes[pdex as usize].deployer_fees, 0);
+    check_invariants(&e.s, e.net_in);
 }
