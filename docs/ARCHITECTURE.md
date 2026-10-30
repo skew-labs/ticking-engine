@@ -1,209 +1,189 @@
 # MEE 아키텍처
 
-솔라나 위에서 **HIP-3처럼 누구나 스테이크를 걸고 자기 perp DEX를 여는** 구조다.
-오더북, 매칭, 증거금, 청산, 펀딩, 정산이 전부 **프로그램 하나 안에** 들어 있다. Percolator 같은 외부 perp 인프라는 쓰지 않는다.
+목표는 **하이퍼리퀴드급(CEX급) perp 거래소를 솔라나 생태계에** 만드는 것이다.
+구조는 하이퍼리퀴드와 같다. **매칭 엔진이 곧 체인**이고, 자금은 솔라나에 있다.
 
-## 1. 왜 "검증기"가 아니라 "프로그램"인가
+```mermaid
+flowchart LR
+    U[트레이더<br/>솔라나 지갑 키로 서명] -- 주문/취소/출금 --> V
+    subgraph V["MEE 체인 (BFT 검증인 N명)"]
+        C[mee-consensus<br/>HotStuff 2-chain BFT] --> S[mee-chain<br/>상태 머신]
+        S --> E[mee-engine<br/>메모리 오더북 + 증거금/청산/펀딩]
+    end
+    subgraph SOL[솔라나]
+        B[MEE 프로그램: 브릿지<br/>입금 기록 / 2/3 서명 출금]
+        VA[(브릿지 볼트<br/>USDC, 스테이크 토큰)]
+    end
+    U -- 입금 --> B --> VA
+    B -. 입금 기록 .-> V
+    V -. 검증인 2/3 서명 영수증 .-> B
+    B -- 출금 --> U
+```
 
-| 선택지 | 의미 | 판단 |
-|---|---|---|
-| 검증기(validator) 자체에 엔진 넣기 | 솔라나를 포크해서 자체 체인(또는 SVM 롤업)을 운영 | 솔라나 메인넷 유동성, 지갑, 토큰(xStocks 등)을 그대로 못 씀. 운영 부담도 큼 |
-| **온체인 프로그램에 엔진 넣기** | 솔라나 메인넷에 프로그램 하나 배포 | **채택.** 체결이 같은 트랜잭션 안에서 바로 정산됨 (crank 없음) |
+## 1. 크레이트 구성
 
-다만 엔진은 `crates/mee-core`로 **솔라나 의존성 없이** 분리해 뒀다.
-나중에 자체 SVM 롤업이나 앱체인으로 가고 싶으면, 같은 crate를 검증기 builtin으로 옮기면 된다.
-
-## 2. HIP-3 ↔ MEE 대응표
-
-| HIP-3 (Hyperliquid) | MEE (Solana) |
+| 크레이트 | 역할 |
 |---|---|
-| 배포자가 HYPE 50만 개 스테이크 | 배포자가 `stake_mint` 토큰을 `min_deployer_stake` 이상 스테이크 (`DeployDex`) |
-| 배포 후 최소 유지 기간 | `min_stake_hold_secs` (기본값 예: 183일) |
-| 언스테이크 대기 중에도 슬래싱 가능 | `RequestUnstake` → `unstake_delay_secs` 동안 슬래싱 가능 → `CompleteUnstake` |
-| 검증인 스테이크 가중 투표로 슬래싱 | **가디언 N명 중 threshold 이상 투표** (`VoteSlash` → `ExecuteSlash`) |
-| 배포자가 오라클 가격 설정 | 배포자가 지정한 `oracle_authority`가 `SetOracle`로 푸시 (변동폭, 빈도 제한 있음) |
-| 배포자 수수료 0~300% | `fee_share_bps` 0~`max_fee_share_bps`(30000). 기본 수수료 **위에 추가로** 부과되고 배포자가 가져감 |
-| 배포자가 시장 중단 → 정산 | `HaltMarket`(정산 가격 지정) → `SettleMarket`(누구나 호출, 페이지 단위) |
-| DEX별 증거금/리스크 격리 | DEX마다 별도 `DexState` 계정 + 별도 USDC 볼트. 한 DEX가 망가져도 다른 DEX에 안 번짐 |
-| 시장별 OI 상한 | `oi_cap`. 넘으면 포지션 늘리는 주문은 거부, 줄이는 주문만 가능 |
-| (없음) | 슬래싱 시 `freeze`면 DEX가 거버넌스로 넘어감: 배포자는 오라클, 시장 추가, 중단, 수수료 수령 불가 |
+| `crates/mee-core` | 공용 수학, 파라미터, 에러 코드. 그리고 **온체인 버전** 엔진 (고정 크기 `Pod`, 솔라나 계정에 바로 매핑) |
+| `crates/mee-engine` | **CEX급 엔진 v2.** 가격 레벨 오더북, 무제한 계정, 여러 HIP-3 DEX, 원자적 연산 |
+| `crates/mee-chain` | **체인 상태 머신.** 서명된 트랜잭션, 논스, 블록 순서 규칙, 브릿지 입출금, 거버넌스(슬래싱), app hash |
+| `crates/mee-consensus` | **BFT 합의** (sans-IO) + 결정적 네트워크 시뮬레이터 |
+| `crates/mee-node` | 합의 → 체인을 잇는 검증인 노드. 4노드 devnet 테스트 |
+| `programs/mee` | **솔라나 프로그램.** 브릿지(입금, 2/3 서명 출금, 검증인 교체) + 온체인 HIP-3 DEX 명령(옵션 C) |
 
-## 3. 계정 구조
+## 2. 측정값
 
-```mermaid
-flowchart TB
-    EX["Exchange (PDA: exchange)<br/>admin, 파라미터, 가디언, 트레저리"]
-    subgraph DEX["배포자 1명 = DexState 계정 1개"]
-        H[Header<br/>배포자, 오라클 권한, 스테이크, 수수료, 보험기금, 슬래싱 투표]
-        M["Market × 8<br/>오라클, 마크용 호가 캐시, 펀딩 인덱스, OI"]
-        T["Trader × 256<br/>담보 + 시장별 포지션"]
-    end
-    B0[Book 계정<br/>시장 0 bids/asks]
-    B1[Book 계정<br/>시장 1 bids/asks]
-    QV[(quote_vault PDA<br/>USDC 담보)]
-    SV[(stake_vault PDA<br/>배포자 스테이크)]
-    EX --> DEX
-    M --> B0
-    M --> B1
-    DEX --> QV
-    DEX --> SV
+4코어 클라우드 컨테이너에서 `--release`로 잰 값이다. 실제 검증인 서버(16~32코어)에선 서명 검증 쪽이 코어 수에 비례해 올라간다.
+
+| 항목 | 값 | 재는 법 |
+|---|---|---|
+| 엔진 단일 스레드 | **약 229만 ops/s** (438ns/op), 미체결 주문 약 31.6만 개 | `cargo bench -p mee-engine` |
+| 체인 전체 (서명 검증 + 논스 + 매칭 + app hash) | **약 14만 tx/s** (4코어), 서명 검증 단독은 약 16만/s | `cargo bench -p mee-chain` |
+| 합의 | 4노드, 링크 지연 5~50ms에서 **초당 약 20블록 확정** (블록당 트랜잭션 수와 무관) | `cargo test -p mee-consensus --release -- --nocapture` |
+
+참고로 하이퍼리퀴드는 공식 문서 기준으로 초당 약 20만 주문, 지연 중간값 약 0.2초이고, 병목은 실행 쪽이라고 한다.
+MEE도 병목은 실행이다. 그중에서도 ed25519 서명 검증이 대부분이고, 매칭 엔진 자체는 그보다 10배 이상 빠르다.
+
+## 3. 엔진 v2 (`mee-engine`)
+
+- **오더북:** 가격 레벨을 `BTreeMap`으로 두고, 각 레벨은 slab 안의 FIFO 연결 리스트다. 주문 ID → slab 인덱스 맵으로 **취소가 O(1)**. 빈 슬롯은 재사용한다.
+- **원자성:** 실패한 연산은 상태를 전혀 바꾸지 않는다. 그래서 블록을 트랜잭션 단위로 적용할 때 스냅샷이 필요 없다.
+  - 주문은 체결, 수수료, OI, 테이커 증거금을 **전부 시뮬레이션한 다음** 적용한다.
+  - 청산은 관련 마진 몇 개만 스냅샷했다가, 청산자 증거금이 부족하면 복원한다.
+- **결정성:** 해시맵은 조회에만 쓰고 순회하지 않는다. 순회가 필요한 건 전부 Vec이나 BTreeMap(가입 순서, 가격 순서)이다.
+- **HIP-3 DEX 격리:** 계정마다 DEX별 마진(담보 + 포지션)을 따로 둔다. 자유 잔고 ↔ DEX 마진은 이체로 옮긴다.
+- **펀딩:** 블록 시작(`begin_block`) 때 기한이 된 시장마다 자동 반영된다. 크랭크 트랜잭션이 필요 없다.
+- **회계 모델:** 온체인 버전과 같다 (9절).
+
+## 4. 체인 상태 머신 (`mee-chain`)
+
+### 트랜잭션
+- **사용자 트랜잭션:** `SignedTx { signer, nonce, action, signature }`
+  - 서명 메시지는 `sha256("MEE/tx" ‖ chain_id ‖ borsh(signer, nonce, action))`
+  - 키가 그냥 ed25519라서 **솔라나 지갑 키로 바로 서명**된다 (E2E 테스트에서 같은 키로 확인함)
+- **논스:** 계정별로 엄격히 증가해야 한다. 서명과 논스가 유효하면 **액션이 실패해도 논스는 소모**돼서 재전송(replay)이 불가능하다.
+- **시스템 트랜잭션:** 검증인 정족수 서명이 필요하다.
+  - `BridgeDeposit`: 솔라나 입금 기록에 대한 증명. 입금 ID가 **순서대로** 와야 함
+  - `Governance`: 슬래싱, 동결된 DEX 시장 중단. 거버넌스 논스로 재사용 방지
+- **정족수:** 검증인 수가 n이면 `⌊2n/3⌋ + 1` (n = 3f + 1 기준 2f + 1)
+
+### 블록 실행
+1. 모든 트랜잭션 서명을 **멀티코어로 배치 검증** (ed25519 batch, 실패하면 개별 검증으로 범인 찾기)
+2. `begin_block(now)`: 펀딩
+3. 순서: **시스템 → 취소 → PostOnly 주문 → 나머지.** 같은 등급 안에선 제안자 순서를 유지한다. 하이퍼리퀴드와 같은 규칙인데, 메이커가 낡은 호가를 저격당하지 않게 보호해준다.
+4. app hash = 이전 hash + 블록 + 결과 + 이벤트 + 출금 영수증의 해시 체인
+
+### 출금
+`Withdraw` 액션은 잔고를 깎고 `WithdrawalReceipt { id, asset, destination, amount }`를 만든다.
+검증인이 `sha256("MEE/withdraw" ‖ chain_id ‖ id ‖ asset ‖ destination ‖ amount)`에 서명하면, 솔라나 브릿지가 정족수를 확인하고 지급한다.
+
+## 5. 합의 (`mee-consensus`)
+
+HotStuff 계열 **2-chain 커밋** (Jolteon / DiemBFT v4 방식)이고, sans-IO라서 네트워크 코드와 분리돼 있다.
+
+| 규칙 | 내용 |
+|---|---|
+| 리더 | 라운드 r의 리더 = `r mod n` |
+| 제안 | 리더가 아는 가장 높은 QC를 넣어서 블록 제안. 직전 라운드가 타임아웃이었으면 TC도 첨부 |
+| 투표 규칙 | 라운드당 한 번, 현재 라운드에만. 블록이 r−1 QC를 잇거나, r−1 TC를 잇고 그 TC의 최고 QC 이상일 때만 |
+| QC | 다음 리더가 2f+1 표를 모으면 QC. QC를 보면 모두 다음 라운드로 |
+| 커밋 규칙 | 블록 B의 **바로 다음 라운드** 자식이 인증되면 B 확정 |
+| 페이스메이커 | 타임아웃이 나면 그 라운드 투표를 멈추고 최고 QC를 브로드캐스트. 2f+1이면 TC. f+1 타임아웃을 보면 따라서 타임아웃(느린 타이머가 발목 잡지 않게). 연속 타임아웃마다 지수 백오프 |
+| 블록 동기화 | 부모를 몰라도 블록은 저장하고 투표. 커밋할 때 빠진 조상을 요청하고, 매 tick 재시도 |
+
+**시뮬레이터 테스트:** 시드 고정이라 결정적이다.
+- 정상, 아무 노드 1개 크래시, 7노드에서 메시지 10% 손실, 네트워크 분할 후 회복, 리더 이중 제안(equivocation)
+- f를 넘는 크래시: **포크 대신 멈추는지** 확인
+- 40가지 장애 조합 랜덤 스윕: **어떤 두 노드도 서로 다른 블록을 확정하지 않는지** 확인
+
+## 6. 솔라나 브릿지 (`programs/mee`의 `bridge`)
+
+| 명령 | 내용 |
+|---|---|
+| `InitBridge` | 브릿지 PDA (검증인 최대 16명, 정족수는 체인과 같은 규칙), USDC/스테이크 볼트 (PDA 소유) |
+| `BridgeDeposit` | 토큰을 볼트에 잠그고 순번이 붙은 `DepositRecord` PDA 생성. 검증인은 이걸 읽어서 순서대로 증명 |
+| `BridgeWithdraw` | 같은 트랜잭션 안의 **Ed25519 precompile**이 검증한 서명을 instructions sysvar로 읽어서 정족수 확인. offset이 전부 precompile 명령 자신을 가리키는 항목만 인정해서, 우리가 읽는 값 = 실제 검증된 값이 되게 함. `WithdrawalRecord` PDA로 영수증당 1회 지급. 받는 토큰 계정의 owner가 영수증의 destination이어야 함 |
+| `RotateValidators` | 현재 검증인 정족수가 `sha256("MEE/valset" ‖ chain_id ‖ nonce ‖ 새 목록)`에 서명해야 교체 |
+
+메시지 바이트가 체인 쪽(`mee-chain::crypto`)과 프로그램 쪽에서 똑같은지는 테스트로 직접 비교한다.
+
+## 7. 체인 안의 HIP-3
+
+| HIP-3 (하이퍼리퀴드) | MEE 체인 |
+|---|---|
+| 배포자 HYPE 스테이크 | 솔라나에서 브릿지한 스테이크 토큰으로 `DeployDex` (`min_deployer_stake` 이상) |
+| 최소 유지, 언스테이크 대기 | `min_stake_hold_secs`, `unstake_delay_secs` (대기 중에도 슬래싱 가능) |
+| 검증인 투표 슬래싱 | `Governance::Slash`: 검증인 정족수 서명, 선택적으로 동결 |
+| 배포자 오라클 | `SetOracle`: DEX의 oracle authority만 가능. 1회 변동폭과 빈도 제한 |
+| 배포자 수수료 0~300% | `fee_share_bps`, 기본 수수료 위에 추가 |
+| 시장 중단 → 정산 | `HaltMarket` → 즉시 전원 정산 (체인 안이라 페이지 나눌 필요 없음) |
+| DEX별 격리 | DEX별 마진, 보험기금, 부실채권 분담 |
+
+## 8. 결정성과 합의 안전성 요약
+
+- 엔진과 체인은 같은 블록을 넣으면 같은 app hash가 나온다. devnet 테스트가 4노드에서 **모든 높이**를 비교한다.
+- 서명 검증만 병렬이고 순수 함수라서 결정성에 영향이 없다.
+- 노드는 커밋 순번을 블록 높이로 쓰고, 타임스탬프는 단조 증가하게 고정한다. 그래서 정직한 노드는 똑같은 체인 블록을 만든다.
+
+## 9. 회계 모델 (온체인, v2 공통)
+
 ```
-
-| 계정 | 생성 | 크기 | 내용 |
-|---|---|---|---|
-| `Exchange` | 프로그램 (PDA `["exchange"]`) | 544 B | admin, quote/stake mint, 트레저리, `EngineParams`, 가디언 |
-| `DexState` | 클라이언트가 만들고 `DeployDex`가 초기화 (DEX 계정이 서명해야 함) | ~145 KB | 헤더 + 시장 8개 + 트레이더 256명 |
-| `Book` | 클라이언트가 만들고 `AddMarket`이 초기화 (book 계정이 서명해야 함) | ~10 KB | bids/asks 각 128개, 가격-시간 우선순위 |
-| `quote_vault` | 프로그램 (PDA `["quote_vault", dex]`) | SPL 토큰 계정 | 모든 트레이더 담보 + 보험기금 + 미수령 수수료 |
-| `stake_vault` | 프로그램 (PDA `["stake_vault", dex]`) | SPL 토큰 계정 | 배포자 스테이크 |
-| `vault_authority` | PDA `["vault_authority", dex]` | 없음 | 두 볼트의 토큰 owner |
-
-모든 상태는 `bytemuck` `Pod` 구조체(8바이트 정렬, 명시적 패딩)라서 **복사 없이 계정 데이터에 바로 매핑**된다.
-
-## 4. 주문 처리 (한 트랜잭션 안에서 끝남)
-
-```mermaid
-sequenceDiagram
-    participant U as 트레이더
-    participant P as MEE 프로그램
-    participant E as mee-core 엔진
-    U->>P: PlaceOrder(side, kind, price, size)
-    P->>E: place_order(DexState, Book)
-    E->>E: 검증 (시장 활성, 틱, 최소 수량, 오라클 신선도, 가격 밴드)
-    E->>E: 테이커 펀딩 정산
-    loop 반대편 최우선 호가가 교차하는 동안 (최대 max_fills)
-        E->>E: 자기 주문이면 → 그 주문 취소 (STP)
-        E->>E: 메이커 펀딩 정산 → 포지션 이동 → 수수료
-    end
-    E->>E: 남은 수량: Limit/PostOnly면 북에 등록, IOC면 버림
-    E->>E: OI 상한 확인 → 테이커 초기 증거금 확인
-    E-->>P: 결과 (실패 시 트랜잭션 전체 롤백)
-```
-
-- **주문 종류:** `Limit`(체결 후 나머지 등록), `PostOnly`(교차하면 거부), `ImmediateOrCancel`(나머지 버림)
-- **reduce-only:** 포지션을 줄이는 방향만 가능하고 크기는 현재 포지션까지로 잘림. 북에 남지 않음. 증거금 체크도 없어서 청산 직전 계정도 포지션을 줄일 수 있다.
-- **북이 가득 찼을 때:** 새 주문이 최악 주문보다 좋으면 최악 주문을 밀어내고 그 주문의 증거금을 풀어줌. 아니면 `BookFull`.
-
-## 5. 회계 모델
-
-### 포지션
-가격 단위는 **베이스 랏당 quote 원자 단위**(USDC 6자리 기준)다.
-
-```
-매수 q @ p:  base += q,  quote -= q·p
-매도 q @ p:  base -= q,  quote += q·p
-미실현 PnL = base · mark + quote
-base가 0이 되면 quote를 담보로 옮김 (실현)
-```
-
-평균 진입가를 따로 저장하지 않는다. 모든 체결이 양쪽에 정확히 반대로 기록되니까 **시장마다 Σbase = 0, Σquote = 0**이 항상 성립한다. 반올림으로 인한 오차가 생기지 않는다.
-
-### 마크 가격
-```
-raw  = median(oracle, best_bid, best_ask)   (한쪽 호가가 비면 oracle)
-mark = clamp(raw, oracle ± mark_band_bps)
-```
-얇은 호가로 마크를 끌고 가는 걸 막으려고 오라클 밴드 안으로 묶는다.
-
-### 증거금 (DEX 안에서 교차 증거금)
-```
+매수 q @ p:  base += q, quote −= q·p      (매도는 반대)
+미실현 PnL = base·mark + quote,  base = 0이 되면 quote → 담보
+mark = clamp(median(oracle, best_bid, best_ask), oracle ± mark_band)
 equity      = 담보 + Σ(base·mark + quote − 미정산 펀딩)
 initial     = Σ max(|base + 미체결 매수|, |base − 미체결 매도|) · mark · IM%
 maintenance = Σ |base| · mark · MM%
 ```
-- 새 주문과 출금은 `equity ≥ initial`을 만족해야 함 (미체결 주문이 전부 체결되는 최악의 경우 기준)
-- `equity < maintenance`면 청산 가능
+- 시장마다 Σbase = 0, Σquote = 0. 펀딩 반올림은 항상 트레이더에게 불리한 쪽이라 남는 건 볼트에 쌓인다.
+- **청산:** 청산자가 마크 가격에 포지션을 인수 (backstop). 페널티는 남은 equity를 넘지 않음. 일부는 보험기금으로
+- **부실채권:** 보험기금 → 같은 DEX 회원의 양수 담보에서 비율대로 분담 → 그래도 남으면 `unrecovered_loss`
+- **불변식:** `들어온 돈 − 나간 돈 + unrecovered ≥ 모든 청구액`. 랜덤 테스트가 매 단계 검사한다.
 
-### 청산
-1. 누구나 `Liquidate` 호출 가능 (청산자도 같은 DEX에 등록된 트레이더여야 함)
-2. 피청산자의 해당 시장 주문 전부 취소
-3. **청산자가 마크 가격에 포지션을 그대로 인수** (backstop 방식이라 호가가 비어 있어도 됨). `max_base`로 부분 청산 가능
-4. 페널티 = 명목가 × `liquidation_fee_bps`. **피청산자에게 남은 equity를 넘지 않게** 캡을 씌움
-5. 페널티 중 `liquidation_insurance_share_bps`만큼은 보험기금, 나머지는 청산자 몫
-6. 청산자는 인수 후에도 초기 증거금을 만족해야 함
+## 10. 온체인 버전 (옵션 C)
 
-### 부실채권
-트레이더가 모든 시장에서 포지션이 없는데 담보가 음수면:
-1. 보험기금에서 먼저 메움
-2. 모자라면 같은 DEX의 다른 트레이더 양수 담보에서 **비율대로 차감** (socialized loss)
-3. 그래도 모자라면 `unrecovered_loss`에 기록 (DEX가 지급불능 상태라는 뜻)
+`mee-core` + `programs/mee`의 DEX 명령들은 **완전히 솔라나 위에서** 돌아가는 HIP-3 DEX다.
+DEX당 쓰기 잠금 계정 하나에 막혀서 CEX급은 못 되지만, 거래량 적은 시장이나 레퍼런스 구현으로 남겨뒀다.
+배포자 스테이크, 가디언 슬래싱, 동결, 시장 중단, 페이지 단위 정산이 다 들어 있다.
 
-### 펀딩
-- 누구나 `UpdateFunding`을 호출할 수 있고, `funding_interval`마다 한 번만 반영됨
-- `rate = clamp((mark − oracle) / oracle, ± max_funding_bps)`
-- 누적 인덱스에 `oracle × rate`를 더하고, 각 포지션은 다음에 건드릴 때 지연 정산
-- 반올림은 항상 **트레이더에게 불리한 쪽** → 남는 차액은 볼트에 쌓임 (볼트가 모자랄 일은 없음)
-
-### 지급능력 불변식
-```
-vault 잔고 + unrecovered_loss ≥ Σ담보 + Σ(quote − 미정산 펀딩) + 보험기금 + 미수령 수수료
-```
-랜덤 테스트가 매 단계마다 이걸 검사한다.
-
-## 6. 배포자 수명주기
-
-```mermaid
-stateDiagram-v2
-    [*] --> Active: DeployDex (스테이크 ≥ 최소)
-    Active --> Active: AddMarket / SetOracle / HaltMarket / 수수료 수령
-    Active --> Frozen: 가디언 슬래싱 (freeze=true)
-    Active --> Unstaking: 모든 시장 Settled + 최소 유지기간 경과 → RequestUnstake
-    Frozen --> Unstaking: admin이 시장 중단 → 정산 → RequestUnstake
-    Unstaking --> Unstaking: 대기 중에도 슬래싱 가능
-    Unstaking --> Retired: unstake_delay 경과 → CompleteUnstake (남은 스테이크 반환)
-```
-
-시장 상태는 `Active → Halted(북 비움, 정산 가격 고정) → Settled(모든 포지션 정산 완료)` 순서로 간다.
-
-## 7. 오라클 안전장치 (배포자 키가 털려도 피해를 제한)
-
-- 한 번에 움직일 수 있는 폭: `max_oracle_move_bps`
-- 업데이트 최소 간격: `min_oracle_interval`
-- 오라클이 `max_oracle_staleness`보다 오래되면 → 포지션을 늘리는 주문, 청산, 펀딩, (노출 있는) 출금이 막힘. reduce-only와 취소는 가능
-- 정산 가격도 오라클에서 한 스텝 이내여야 함
-- 그래도 악용하면 가디언이 슬래싱하고 DEX를 동결
-
-## 8. 파라미터 (`EngineParams`)
-
-| 이름 | 의미 | 테스트에서 쓴 값 |
-|---|---|---|
-| `taker_fee_bps` / `maker_fee_bps` | 프로토콜 기본 수수료 | 5 / 1 |
-| `max_fee_share_bps` | 배포자 추가 수수료 상한 | 30000 (300%) |
-| `max_oracle_move_bps` | 오라클 1회 최대 변동 | 500 (5%) |
-| `min_oracle_interval` | 오라클 업데이트 최소 간격(초) | 0 |
-| `max_oracle_staleness` | 오라클 유효 시간(초) | 60 ~ 3600 |
-| `mark_band_bps` | 마크 가격 밴드 | 100 (1%) |
-| `order_band_bps` | 주문 가격 밴드 | 5000 (50%) |
-| `max_fills_per_order` | 주문당 최대 체결 수 (CU 상한) | 16 ~ 32 |
-| `liquidation_insurance_share_bps` | 페널티 중 보험기금 몫 | 5000 |
-| `min_deployer_stake` | 최소 배포자 스테이크 | 500,000 |
-| `min_stake_hold_secs` | 배포 후 최소 유지 | 1000 (실서비스는 183일 권장) |
-| `unstake_delay_secs` | 언스테이크 대기 | 100 (실서비스는 7일 권장) |
-| `min_initial_margin_bps` | 최대 레버리지 상한 | 500 (20배) |
-
-시장별로는 `tick_size`, `min_base_lots`, `initial/maintenance_margin_bps`, `liquidation_fee_bps`, `oi_cap`, `funding_interval`, `max_funding_bps`를 따로 정한다.
-
-## 9. 테스트
-
-| 테스트 | 위치 | 내용 |
-|---|---|---|
-| 단위 테스트 10개 | `crates/mee-core/src/*` | 반올림, 중앙값, 북 정렬과 eviction, 마크 가격, 펀딩 반올림, 레이아웃 |
-| 시나리오 17개 | `crates/mee-core/tests/engine.rs` | 체결, 우선순위, PostOnly/IOC, STP, PnL 실현, 증거금, 출금, reduce-only, OI 상한, 청산, 부실채권 분담, 펀딩, 오라클 제한, 중단→정산→언스테이크, 슬래싱 |
-| 랜덤 불변식 테스트 | 같은 파일 | 시드 12개 × 3000 스텝. 매 스텝마다 Σbase=0, OI 일치, 미체결 수량 일치, 북 정렬, 호가 캐시, 지급능력 검사. 마지막엔 전체 정산 후 전원 출금 |
-| 프로그램 E2E 4개 | `programs/mee/tests/program.rs` | `solana-program-test` 안에서 진짜 SPL Token과 함께: 배포→거래→청산→출금→수수료 수령, 권한 검사(계정 탈취 포함), 중단→정산→언스테이크, 가디언 슬래싱→동결→admin 정리 |
+## 11. 테스트
 
 ```bash
-cargo test --workspace     # 전체
-cargo test -p mee-core     # 엔진만 (몇 초)
+cargo test --workspace                 # 전부
+cargo test -p mee-consensus --release  # 합의 시뮬레이션 (빠르게)
+cargo bench -p mee-engine              # 엔진 처리량
+cargo bench -p mee-chain               # 체인 처리량
 ```
 
-## 10. 한계와 다음 단계
+| 크레이트 | 테스트 |
+|---|---|
+| mee-core | 단위 10 + 시나리오 17 + 랜덤 불변식 (36k 액션) |
+| mee-engine | 단위 1 + 시나리오 10 + 랜덤 원자성/불변식 (32k 액션, 거부된 액션이 상태를 안 바꿨는지 지문 비교) |
+| mee-chain | 단위 2 + 7 (서명/논스/재전송, 입금 정족수와 순서, 출금 영수증, 취소 우선 순서, 레플리카 일치, 거버넌스, 배치 서명 위조 탐지) |
+| mee-consensus | 시뮬레이션 8 (위 5절) |
+| mee-node | devnet 2 (4노드 전원 정상 / 1노드 크래시, 모든 높이에서 app hash 일치) |
+| programs/mee | 온체인 DEX E2E 4 + 브릿지 E2E 3 (솔라나 입금 → 체인 반영 → 체인 출금 → 2/3 서명 → 솔라나 지급, 정족수 미달/외부인/위조 서명/재전송/엉뚱한 수령인/검증인 교체) |
 
-- **SBF 빌드 미검증:** 이 환경엔 솔라나 플랫폼 툴(`cargo build-sbf`)이 없어서, 테스트는 프로그램을 네이티브로 돌렸다. 실제 배포 전에 SBF 빌드와 **CU 측정**이 필요하다 (네이티브 모드는 CU를 안 잰다).
-- **시계/렌트는 sysvar 계정으로 받음:** 현재 SDK 4.x는 네이티브 테스트에서 `Clock::get()`이 안 돼서, 시간이 필요한 명령은 Clock sysvar 계정을 마지막 계정으로 받는다.
-- **DEX당 쓰기 잠금 하나:** 한 DEX의 모든 거래가 같은 `DexState`를 잠그니까 DEX 안에서는 순차 처리된다 (Hyperliquid도 DEX별로 순차). DEX끼리는 병렬로 돈다.
-- **트레이더 조회가 선형 탐색:** 256명 기준이라 괜찮지만, 키우려면 인덱스 힌트를 명령에 넣어야 함.
-- **ADL 없음:** 부실채권은 보험기금 → 비율 분담 순서로 처리한다.
-- **펀딩 프리미엄을 한 번만 샘플링:** 크랭크 시점의 마크만 본다. 실서비스는 구간 평균(TWAP)이 필요.
-- **가디언 교체:** `UpdateExchange`로 가디언을 바꿀 때 진행 중인 슬래싱 투표는 `ClearSlash`로 먼저 정리해야 한다.
-- **감사 전 코드:** 보안 감사를 받기 전엔 실자금에 쓰면 안 된다.
+## 12. 한계와 다음 단계
+
+**합의, 노드**
+- **리더 평판 없음:** 라운드로빈이라 죽은 노드가 리더가 되거나 그 노드에 투표를 보내는 라운드는 타임아웃이 난다. 4노드 중 1개가 죽으면 블록 속도가 크게 떨어진다 (devnet 테스트에서 확인). DiemBFT식 leader reputation이 필요하다.
+- **영속성 없음:** `last_voted_round`를 디스크에 안 쓴다. 재시작한 노드가 같은 라운드에 다시 투표하면 안전성이 깨질 수 있다. WAL과 스냅샷이 필요하다.
+- **실제 네트워크 계층 없음:** P2P(QUIC/TCP), 멤풀 가십, 상태 동기화는 아직 없다. 지금은 테스트 하네스가 메시지를 직접 배달한다.
+- **API 없음:** WebSocket/REST가 없다.
+
+**체인**
+- **체인 쪽 검증인 교체 없음:** 브릿지엔 `RotateValidators`가 있는데, 체인 쪽엔 검증인 스테이킹과 집합 변경이 아직 없다.
+- **app hash가 상태 머클 루트가 아님:** 결과와 이벤트의 해시 체인이다. 라이트 클라이언트가 상태를 증명하려면 머클화된 상태가 필요하다.
+- **출금 이의제기 기간 없음:** 하이퍼리퀴드 브릿지엔 출금 후 분쟁 기간이 있는데, 아직 안 넣었다.
+
+**브릿지**
+- **트랜잭션 크기 제한:** Ed25519 서명 항목이 각각 약 110바이트라서, 솔라나 트랜잭션 하나(1232바이트)에 약 6~7개가 한계다. 검증인을 늘리려면 여러 precompile 명령이나 트랜잭션으로 나누거나, BLS/ZK 집계가 필요하다.
+
+**엔진**
+- 펀딩 프리미엄을 블록 시점에 한 번만 샘플링한다 → TWAP 필요
+- ADL 없음
+
+**공통**
+- 솔라나 프로그램의 SBF 빌드와 CU 측정을 아직 못 했다 (이 환경에 플랫폼 툴이 없음)
+- **보안 감사 전이다.** 실자금에 쓰면 안 된다.
