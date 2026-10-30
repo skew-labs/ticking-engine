@@ -1,0 +1,15 @@
+[package]
+name = "mee-engine"
+description = "CEX-grade in-memory matching and risk engine for the MEE chain"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mee-core = { path = "../mee-core" }
+rustc-hash.workspace = true
+
+[[bench]]
+name = "throughput"
+harness = false

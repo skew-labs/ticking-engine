@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mee-core", "programs/mee"]
+members = ["crates/mee-core", "crates/mee-engine", "programs/mee"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,9 @@ publish = false
 [workspace.dependencies]
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics", "extern_crate_alloc"] }
 borsh = { version = "1.5", features = ["derive"] }
+rustc-hash = "2"
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+sha2 = "0.10"
 
 [profile.release]
 overflow-checks = true
