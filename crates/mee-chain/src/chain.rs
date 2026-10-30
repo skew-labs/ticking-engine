@@ -1,0 +1,361 @@
+//! The replicated state machine: every validator applies the same ordered
+//! blocks and must reach the same app hash.
+
+use mee_core::{EngineError, EngineParams, OrderKind, Side};
+use mee_engine::engine::Result as EngineResult;
+use mee_engine::{AccountId, CancelReason, Event, OrderRequest, State};
+use rustc_hash::FxHashMap;
+
+use crate::crypto::{self, Hash, Pubkey};
+use crate::tx::*;
+
+#[derive(Clone, Debug)]
+pub struct Genesis {
+    pub chain_id: u64,
+    pub params: EngineParams,
+    pub validators: Vec<Pubkey>,
+    pub timestamp_ms: i64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TxError {
+    BadSignature,
+    StaleNonce,
+    UnknownAccount,
+    BadAction,
+    /// Bridge deposit id is not the next expected one.
+    DepositOutOfOrder,
+    GovernanceNonce,
+    /// Not enough distinct, valid validator signatures.
+    NoQuorum,
+    Engine(EngineError),
+}
+
+impl From<EngineError> for TxError {
+    fn from(e: EngineError) -> Self {
+        TxError::Engine(e)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BlockError {
+    WrongHeight,
+    TimeWentBackwards,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BlockOutcome {
+    /// Per transaction in execution order (system, cancels, post-only, rest).
+    pub results: Vec<Result<(), TxError>>,
+    pub events: Vec<Event>,
+    pub withdrawals: Vec<WithdrawalReceipt>,
+    pub app_hash: Hash,
+}
+
+#[derive(Clone, Debug)]
+pub struct Chain {
+    pub chain_id: u64,
+    pub validators: Vec<Pubkey>,
+    pub state: State,
+    pub height: u64,
+    pub timestamp_ms: i64,
+    pub app_hash: Hash,
+    /// Highest nonce used per signer. Lookup only, so iteration order never
+    /// leaks into state.
+    pub nonces: FxHashMap<Pubkey, u64>,
+    pub next_deposit_id: u64,
+    pub next_withdrawal_id: u64,
+    pub governance_nonce: u64,
+    /// Every withdrawal ever queued, by id (the Solana bridge dedups payouts).
+    pub withdrawals: Vec<WithdrawalReceipt>,
+}
+
+impl Chain {
+    pub fn new(g: Genesis) -> Chain {
+        let mut state = State::new(g.params);
+        state.now = g.timestamp_ms / 1_000;
+        Chain {
+            chain_id: g.chain_id,
+            validators: g.validators,
+            state,
+            height: 0,
+            timestamp_ms: g.timestamp_ms,
+            app_hash: crypto::sha256(&[b"MEE/genesis", &g.chain_id.to_le_bytes()]),
+            nonces: FxHashMap::default(),
+            next_deposit_id: 0,
+            next_withdrawal_id: 0,
+            governance_nonce: 0,
+            withdrawals: Vec::new(),
+        }
+    }
+
+    /// Mempool admission: signature and nonce, no execution.
+    pub fn check_tx(&self, tx: &Tx) -> Result<(), TxError> {
+        self.verify_tx(tx)?;
+        self.check_nonce(tx)
+    }
+
+    /// Stateless signature checks (user signature or validator quorum).
+    pub fn verify_tx(&self, tx: &Tx) -> Result<(), TxError> {
+        match tx {
+            Tx::User(t) => {
+                if t.verify(self.chain_id) {
+                    Ok(())
+                } else {
+                    Err(TxError::BadSignature)
+                }
+            }
+            Tx::System(SystemTx::BridgeDeposit { deposit_id, owner, asset, amount, attestations }) => {
+                let msg = crypto::deposit_message(self.chain_id, *deposit_id, owner, *asset, *amount);
+                self.check_quorum(&msg, attestations)
+            }
+            Tx::System(SystemTx::Governance { nonce, action, attestations }) => {
+                let msg = crypto::governance_message(self.chain_id, *nonce, &borsh::to_vec(action).expect("borsh"));
+                self.check_quorum(&msg, attestations)
+            }
+        }
+    }
+
+    fn check_nonce(&self, tx: &Tx) -> Result<(), TxError> {
+        if let Tx::User(t) = tx
+            && t.nonce <= self.nonces.get(&t.signer).copied().unwrap_or(0)
+        {
+            return Err(TxError::StaleNonce);
+        }
+        Ok(())
+    }
+
+    /// Verifies every transaction's signatures across all cores. Pure, so
+    /// running it in parallel keeps execution deterministic.
+    pub fn verify_parallel(&self, txs: &[Tx]) -> Vec<Result<(), TxError>> {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if threads == 1 || txs.len() < 64 {
+            return txs.iter().map(|t| self.verify_tx(t)).collect();
+        }
+        let chunk = txs.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = txs.chunks(chunk).map(|c| scope.spawn(move || self.verify_chunk(c))).collect();
+            handles.into_iter().flat_map(|h| h.join().expect("verifier thread")).collect()
+        })
+    }
+
+    /// Batch-verifies the user signatures of a chunk (about twice as fast as
+    /// one by one); falls back to single checks to pinpoint a bad one.
+    fn verify_chunk(&self, txs: &[Tx]) -> Vec<Result<(), TxError>> {
+        let mut msgs = Vec::new();
+        let mut sigs = Vec::new();
+        let mut keys = Vec::new();
+        for tx in txs {
+            if let Tx::User(t) = tx {
+                let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&t.signer) else {
+                    return txs.iter().map(|t| self.verify_tx(t)).collect();
+                };
+                msgs.push(SignedTx::message(self.chain_id, &t.signer, t.nonce, &t.action));
+                sigs.push(ed25519_dalek::Signature::from_bytes(&t.signature));
+                keys.push(vk);
+            }
+        }
+        let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
+        if !keys.is_empty() && ed25519_dalek::verify_batch(&refs, &sigs, &keys).is_ok() {
+            return txs.iter().map(|t| if matches!(t, Tx::User(_)) { Ok(()) } else { self.verify_tx(t) }).collect();
+        }
+        txs.iter().map(|t| self.verify_tx(t)).collect()
+    }
+
+    fn check_quorum(&self, msg: &Hash, attestations: &[Attestation]) -> Result<(), TxError> {
+        let mut seen = vec![false; self.validators.len()];
+        let mut valid = 0;
+        for a in attestations {
+            let i = a.validator as usize;
+            if i >= self.validators.len() || seen[i] {
+                continue;
+            }
+            if crypto::verify(&self.validators[i], msg, &a.signature) {
+                seen[i] = true;
+                valid += 1;
+            }
+        }
+        if valid >= crypto::quorum(self.validators.len()) { Ok(()) } else { Err(TxError::NoQuorum) }
+    }
+
+    /// Applies a committed block. Individual transactions may fail (their
+    /// result says why) without failing the block.
+    pub fn apply_block(&mut self, block: &Block) -> Result<BlockOutcome, BlockError> {
+        if block.height != self.height + 1 {
+            return Err(BlockError::WrongHeight);
+        }
+        if block.timestamp_ms < self.timestamp_ms {
+            return Err(BlockError::TimeWentBackwards);
+        }
+        self.height = block.height;
+        self.timestamp_ms = block.timestamp_ms;
+
+        let mut out = BlockOutcome::default();
+        let verified = self.verify_parallel(&block.txs);
+        let mut order: Vec<usize> = (0..block.txs.len()).collect();
+        order.sort_by_key(|&i| block.txs[i].priority()); // stable: keeps proposer order within a class
+
+        let _ = self.state.begin_block(block.timestamp_ms / 1_000, &mut out.events);
+        for i in order {
+            let tx = &block.txs[i];
+            let r = verified[i].and_then(|_| self.check_nonce(tx)).and_then(|_| self.execute(tx, &mut out));
+            out.results.push(r);
+        }
+
+        let mut h = sha2_chain(&self.app_hash, block);
+        for r in &out.results {
+            h = crypto::sha256(&[&h, format!("{r:?}").as_bytes()]);
+        }
+        for e in &out.events {
+            h = crypto::sha256(&[&h, format!("{e:?}").as_bytes()]);
+        }
+        for w in &out.withdrawals {
+            h = crypto::sha256(&[&h, &borsh::to_vec(w).expect("borsh")]);
+        }
+        self.app_hash = h;
+        out.app_hash = h;
+        Ok(out)
+    }
+
+    fn execute(&mut self, tx: &Tx, out: &mut BlockOutcome) -> Result<(), TxError> {
+        match tx {
+            Tx::System(SystemTx::BridgeDeposit { deposit_id, owner, asset, amount, .. }) => {
+                if *deposit_id != self.next_deposit_id {
+                    return Err(TxError::DepositOutOfOrder);
+                }
+                match *asset {
+                    ASSET_QUOTE => self.state.deposit(owner, *amount)?,
+                    ASSET_STAKE => self.state.deposit_stake(owner, *amount)?,
+                    _ => return Err(TxError::BadAction),
+                };
+                self.next_deposit_id += 1;
+                Ok(())
+            }
+            Tx::System(SystemTx::Governance { nonce, action, .. }) => {
+                if *nonce != self.governance_nonce {
+                    return Err(TxError::GovernanceNonce);
+                }
+                match action {
+                    Governance::Slash { dex, bps, freeze } => {
+                        self.state.slash(*dex, *bps, *freeze, &mut out.events)?;
+                    }
+                    Governance::HaltMarket { market, price } => {
+                        self.state.halt_market(None, *market, *price, &mut out.events)?;
+                    }
+                }
+                self.governance_nonce += 1;
+                Ok(())
+            }
+            Tx::User(t) => {
+                // A valid signature with a fresh nonce consumes the nonce even
+                // if the action fails, so it can never be replayed.
+                self.nonces.insert(t.signer, t.nonce);
+                self.execute_action(&t.signer, &t.action, out)
+            }
+        }
+    }
+
+    fn account(&self, key: &Pubkey) -> Result<AccountId, TxError> {
+        self.state.account_id(key).ok_or(TxError::UnknownAccount)
+    }
+
+    fn execute_action(&mut self, signer: &Pubkey, action: &Action, out: &mut BlockOutcome) -> Result<(), TxError> {
+        let r: EngineResult<()> = match action {
+            Action::PlaceOrder { market, side, kind, price, size, reduce_only, client_id } => {
+                let a = self.account(signer)?;
+                let req = OrderRequest {
+                    market: *market,
+                    side: Side::from_u8(*side).ok_or(TxError::BadAction)?,
+                    kind: OrderKind::from_u8(*kind).ok_or(TxError::BadAction)?,
+                    price: *price,
+                    size: *size,
+                    reduce_only: *reduce_only,
+                    client_id: *client_id,
+                };
+                self.state.place_order(a, &req, &mut out.events).map(|_| ())
+            }
+            Action::Cancel { market, order_id } => {
+                let a = self.account(signer)?;
+                self.state.cancel(a, *market, *order_id, &mut out.events)
+            }
+            Action::CancelAll { market } => {
+                let a = self.account(signer)?;
+                self.state.cancel_all(a, *market, CancelReason::User, &mut out.events).map(|_| ())
+            }
+            Action::Liquidate { target, market, max_size } => {
+                let a = self.account(signer)?;
+                let t = self.account(target)?;
+                self.state.liquidate(a, t, *market, *max_size, &mut out.events).map(|_| ())
+            }
+            Action::TransferToDex { dex, amount } => {
+                let a = self.account(signer)?;
+                self.state.transfer_to_dex(a, *dex, *amount)
+            }
+            Action::TransferFromDex { dex, amount } => {
+                let a = self.account(signer)?;
+                self.state.transfer_from_dex(a, *dex, *amount)
+            }
+            Action::FundInsurance { dex, amount } => {
+                let a = self.account(signer)?;
+                self.state.fund_insurance(a, *dex, *amount)
+            }
+            Action::Withdraw { asset, amount, destination } => {
+                let a = self.account(signer)?;
+                match *asset {
+                    ASSET_QUOTE => self.state.withdraw(a, *amount)?,
+                    ASSET_STAKE => self.state.withdraw_stake(a, *amount)?,
+                    _ => return Err(TxError::BadAction),
+                }
+                let receipt = WithdrawalReceipt {
+                    id: self.next_withdrawal_id,
+                    asset: *asset,
+                    destination: *destination,
+                    amount: *amount,
+                };
+                self.next_withdrawal_id += 1;
+                self.withdrawals.push(receipt);
+                out.withdrawals.push(receipt);
+                Ok(())
+            }
+            Action::DeployDex { name, fee_share_bps, stake, oracle_authority } => {
+                let a = self.account(signer)?;
+                self.state.deploy_dex(a, *name, *fee_share_bps, *stake, *oracle_authority, &mut out.events).map(|_| ())
+            }
+            Action::AddMarket { dex, config } => {
+                let a = self.account(signer)?;
+                self.state.add_market(a, *dex, (*config).into(), &mut out.events).map(|_| ())
+            }
+            Action::SetOracle { dex, prices } => self.state.set_oracle(signer, *dex, prices),
+            Action::SetFeeShare { dex, bps } => {
+                let a = self.account(signer)?;
+                self.state.set_fee_share(a, *dex, *bps)
+            }
+            Action::SetOracleAuthority { dex, authority } => {
+                let a = self.account(signer)?;
+                self.state.set_oracle_authority(a, *dex, *authority)
+            }
+            Action::HaltMarket { market, price } => {
+                let a = self.account(signer)?;
+                self.state.halt_market(Some(a), *market, *price, &mut out.events)
+            }
+            Action::RequestUnstake { dex } => {
+                let a = self.account(signer)?;
+                self.state.request_unstake(a, *dex)
+            }
+            Action::CompleteUnstake { dex } => {
+                let a = self.account(signer)?;
+                self.state.complete_unstake(a, *dex).map(|_| ())
+            }
+            Action::ClaimDeployerFees { dex } => {
+                let a = self.account(signer)?;
+                self.state.claim_deployer_fees(a, *dex).map(|_| ())
+            }
+            Action::SweepProtocolFees { dex } => self.state.sweep_protocol_fees(*dex).map(|_| ()),
+        };
+        r.map_err(TxError::from)
+    }
+}
+
+fn sha2_chain(prev: &Hash, block: &Block) -> Hash {
+    crypto::sha256(&[b"MEE/app", prev, &block.hash()])
+}
