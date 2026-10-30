@@ -29,6 +29,81 @@ use rustc_hash::FxHashMap;
 
 use crate::types::*;
 
+/// QC validity under a validator set: the genesis QC (round 0, no votes),
+/// or 2f+1 distinct valid votes.
+pub fn qc_is_valid(validators: &[Pubkey], genesis: &Hash, qc: &Qc) -> bool {
+    if qc.round == 0 {
+        return qc.block == *genesis && qc.votes.is_empty();
+    }
+    let msg = vote_message(&qc.block, qc.round);
+    let mut seen = vec![false; validators.len()];
+    let mut n = 0;
+    for (v, sig) in &qc.votes {
+        let i = *v as usize;
+        if i < seen.len() && !seen[i] && verify(&validators[i], &msg, sig) {
+            seen[i] = true;
+            n += 1;
+        }
+    }
+    n >= quorum(validators.len())
+}
+
+/// How a synced chain segment proves its last block is committed.
+#[derive(Clone, Debug, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub enum CommitProof {
+    /// The next two committed blocks: the first is from the very next round
+    /// and the second certifies it (the 2-chain rule).
+    Children(Block, Block),
+    /// Void blocks after the segment (an epoch's tail past its boundary),
+    /// then a block certified by `qc` from the round right after the last of
+    /// them.
+    Witness { tail: Vec<Block>, certified: Block, qc: Qc },
+}
+
+/// Checks that `blocks` extend `prev` as a chain of certified blocks and
+/// that `proof` shows the last one committed, all under `validators`.
+pub fn verify_committed_segment(
+    validators: &[Pubkey],
+    genesis: &Hash,
+    prev: &Hash,
+    blocks: &[Block],
+    proof: &CommitProof,
+) -> bool {
+    let mut prev = *prev;
+    let mut last_round = None;
+    let check = |b: &Block, prev: &mut Hash| -> bool {
+        let ok = b.qc.block == *prev && qc_is_valid(validators, genesis, &b.qc);
+        *prev = b.hash();
+        ok
+    };
+    for b in blocks {
+        if !check(b, &mut prev) {
+            return false;
+        }
+        last_round = Some(b.round);
+    }
+    match proof {
+        CommitProof::Children(c1, c2) => {
+            let Some(r) = last_round else { return false };
+            c1.round == r + 1 && check(c1, &mut prev) && check(c2, &mut prev)
+        }
+        CommitProof::Witness { tail, certified, qc } => {
+            let mut r = last_round;
+            for b in tail {
+                if !check(b, &mut prev) {
+                    return false;
+                }
+                r = Some(b.round);
+            }
+            let Some(r) = r else { return false };
+            certified.round == r + 1
+                && check(certified, &mut prev)
+                && qc.block == certified.hash()
+                && qc_is_valid(validators, genesis, qc)
+        }
+    }
+}
+
 pub const REPUTATION_WINDOW: usize = 10;
 pub const REPUTATION_LAG: u64 = 3;
 
@@ -67,6 +142,7 @@ pub struct Replica {
     history: VecDeque<(Round, u64)>,
     /// An ancestor we need before we can commit; re-requested every tick.
     missing: Option<Hash>,
+    witness: Option<(Block, Qc)>,
     mempool: VecDeque<Vec<u8>>,
     now: u64,
 }
@@ -94,6 +170,7 @@ impl Replica {
             commits: Vec::new(),
             history: VecDeque::new(),
             missing: None,
+            witness: None,
             mempool: VecDeque::new(),
             now: 0,
         }
@@ -231,20 +308,13 @@ impl Replica {
     // --- verification --------------------------------------------------------
 
     fn valid_qc(&self, qc: &Qc) -> bool {
-        if qc.round == 0 {
-            return qc.block == self.genesis && qc.votes.is_empty();
-        }
-        let msg = vote_message(&qc.block, qc.round);
-        let mut seen = vec![false; self.validators.len()];
-        let mut n = 0;
-        for (v, sig) in &qc.votes {
-            let i = *v as usize;
-            if i < seen.len() && !seen[i] && verify(&self.validators[i], &msg, sig) {
-                seen[i] = true;
-                n += 1;
-            }
-        }
-        n >= self.quorum()
+        qc_is_valid(&self.validators, &self.genesis, qc)
+    }
+
+    /// The block certified by the QC that made the latest commit: proof that
+    /// everything up to `last_committed` is final (used to serve state sync).
+    pub fn commit_witness(&self) -> Option<&(Block, Qc)> {
+        self.witness.as_ref()
     }
 
     fn valid_tc(&self, tc: &Tc) -> bool {
@@ -493,6 +563,7 @@ impl Replica {
             cur = blk.parent();
         }
         chain.reverse();
+        self.witness = Some((b.clone(), qc.clone()));
         self.committed_round = parent_round;
         self.last_committed = parent;
         for blk in &chain {

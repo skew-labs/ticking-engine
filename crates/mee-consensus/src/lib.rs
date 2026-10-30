@@ -7,5 +7,5 @@ pub mod replica;
 pub mod sim;
 pub mod types;
 
-pub use replica::{Config, Replica};
+pub use replica::{CommitProof, Config, Replica, qc_is_valid, verify_committed_segment};
 pub use types::*;

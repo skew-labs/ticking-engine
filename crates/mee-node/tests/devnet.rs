@@ -377,3 +377,50 @@ fn stake_rotates_validators_across_epochs() {
     net.assert_agreement();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn late_joiner_catches_up_by_verified_sync() {
+    // Node 4 is an observer that is offline from genesis; 4 validators run,
+    // with an epoch change (node 4 gets staked in) along the way.
+    let staking = Staking { epoch_blocks: 30, max_validators: 4, min_validator_stake: 10, unbond_secs: 1 };
+    let mut net = Devnet::build(5, 4, vec![4], None, staking);
+    let whale = SigningKey::from_bytes(&[9; 32]);
+    net.deposit(&whale, ASSET_STAKE, 1_000);
+    net.run(300);
+    let newcomer = net.nodes[4].me;
+    net.user_tx(&whale, Action::Delegate { validator: newcomer, amount: 500 });
+    net.run(6_000);
+    let target = net.nodes[0].height();
+    // The offline node is in the new set, so after the boundary the network
+    // runs 3-of-4 (slower) until it returns.
+    assert!(target > 100, "a long chain to catch up on: {target}");
+    assert_eq!(net.nodes[0].epoch, 1, "the set changed while node 4 was away");
+
+    // Tampering with a served segment is detected.
+    let req = net.nodes[4].sync_request();
+    let mut bad = net.nodes[0].serve_sync(&req).unwrap();
+    bad.blocks[3].payload.push(0);
+    let mut fresh = Node::new(net.keys[4].clone(), net.genesis.clone(), net.cfg);
+    assert_eq!(fresh.apply_sync(bad, net.now), Err(mee_node::SyncError::BadProof));
+
+    // Sync in batches from any peer until caught up, across the epoch.
+    let mut rounds = 0;
+    while net.nodes[4].height() < net.nodes[0].height() {
+        let req = net.nodes[4].sync_request();
+        let peer = 1 + rounds % 3;
+        let Some(resp) = net.nodes[peer].serve_sync(&req) else { break };
+        assert!(resp.blocks.len() <= mee_node::SYNC_BATCH + 64);
+        net.nodes[4].apply_sync(resp, net.now).unwrap();
+        rounds += 1;
+    }
+    assert!(rounds > 1, "synced in several batches (one per epoch at least)");
+    assert_eq!(net.nodes[4].epoch, 1);
+    assert!(net.nodes[4].replica.is_validator(), "it is in the new set");
+    assert!(net.nodes[4].height() + 5 >= net.nodes[0].height());
+
+    // Back online: it joins consensus and the network agrees everywhere.
+    net.crashed.clear();
+    net.run(2_000);
+    let h = net.assert_agreement();
+    assert!(h as u64 > target);
+}

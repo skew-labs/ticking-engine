@@ -19,7 +19,7 @@ use std::path::Path;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::SigningKey;
 use mee_chain::{Block, BlockOutcome, Chain, Genesis, Tx, crypto};
-use mee_consensus::{Config, Hash, Message, NodeId, Out, Pubkey, Replica};
+use mee_consensus::{CommitProof, Config, Hash, Message, NodeId, Out, Pubkey, Qc, Replica, verify_committed_segment};
 
 use crate::storage::Storage;
 
@@ -35,6 +35,33 @@ pub struct Envelope {
     pub from: Pubkey,
     pub msg: Message,
 }
+
+/// Ask a peer for committed blocks starting at `from_height`.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct SyncRequest {
+    pub from_height: u64,
+}
+
+/// A segment of one epoch's committed blocks with proof that the last one is
+/// committed. The receiver checks it against validator signatures alone, so
+/// any peer can serve it.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct SyncResponse {
+    pub epoch: u64,
+    pub from_height: u64,
+    pub blocks: Vec<mee_consensus::Block>,
+    pub proof: CommitProof,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SyncError {
+    WrongEpoch,
+    WrongHeight,
+    BadProof,
+}
+
+/// Blocks per sync response (soft limit).
+pub const SYNC_BATCH: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetOut {
@@ -58,6 +85,13 @@ pub struct Node {
     pub outcomes: Vec<BlockOutcome>,
     max_block_txs: usize,
     storage: Option<Storage>,
+    /// Every applied consensus block with its epoch (index = height - 1).
+    committed: Vec<(u64, mee_consensus::Block)>,
+    /// Ended epochs: blocks committed past the boundary (void) and the
+    /// certified block + QC that proved the last commit.
+    epoch_tails: std::collections::BTreeMap<u64, (Vec<mee_consensus::Block>, mee_consensus::Block, Qc)>,
+    /// Consensus genesis of the current epoch.
+    epoch_genesis: Hash,
 }
 
 fn consensus_genesis(chain: &Chain) -> Hash {
@@ -86,6 +120,7 @@ impl Node {
     pub fn new(key: SigningKey, genesis: Genesis, cfg: Config) -> Node {
         let chain = Chain::new(genesis);
         let replica = make_replica(&key, &chain, cfg);
+        let epoch_genesis = consensus_genesis(&chain);
         Node {
             me: crypto::pubkey(&key),
             key,
@@ -99,6 +134,9 @@ impl Node {
             outcomes: Vec::new(),
             max_block_txs: 20_000,
             storage: None,
+            committed: Vec::new(),
+            epoch_tails: Default::default(),
+            epoch_genesis,
         }
     }
 
@@ -115,10 +153,14 @@ impl Node {
     ) -> std::io::Result<(Node, Vec<NetOut>)> {
         let (storage, rec) = Storage::open(dir)?;
         let mut node = Node::new(key, genesis, cfg);
-        for (_, b) in &rec.blocks {
+        for (e, b) in &rec.blocks {
+            node.committed.push((*e, b.clone()));
             node.apply_payload(&b.payload);
+            if node.chain.epoch != node.epoch {
+                node.epoch = node.chain.epoch;
+                node.epoch_genesis = consensus_genesis(&node.chain);
+            }
         }
-        node.epoch = node.chain.epoch;
         node.replica = make_replica(&node.key, &node.chain, cfg);
         let current: Vec<_> = rec.blocks.iter().filter(|(e, _)| *e == node.epoch).map(|(_, b)| b.clone()).collect();
         let outs = match rec.safety {
@@ -170,19 +212,36 @@ impl Node {
     /// Applies newly committed blocks; on an epoch change, switches
     /// consensus instances and returns the new instance's start output.
     fn apply_commits(&mut self, now_ms: u64) -> Vec<Out> {
+        let mut void = Vec::new();
         for b in self.replica.drain_commits() {
             if self.chain.epoch != self.epoch {
-                break; // old-epoch commits past the boundary are void for everyone
+                void.push(b); // old-epoch commits past the boundary are void for everyone
+                continue;
             }
-            if let Some(st) = self.storage.as_mut() {
-                st.append_block(self.epoch, &b).expect("append committed block");
-            }
-            self.apply_payload(&b.payload);
+            self.commit_block(b);
         }
         if self.chain.epoch == self.epoch {
             return Vec::new();
         }
+        if let Some((certified, qc)) = self.replica.commit_witness().cloned() {
+            self.epoch_tails.insert(self.epoch, (void, certified, qc));
+        }
+        self.enter_epoch(now_ms)
+    }
+
+    fn commit_block(&mut self, b: mee_consensus::Block) {
+        if let Some(st) = self.storage.as_mut() {
+            st.append_block(self.epoch, &b).expect("append committed block");
+        }
+        self.apply_payload(&b.payload);
+        self.committed.push((self.epoch, b));
+    }
+
+    /// Starts the consensus instance of the chain's (new) epoch and replays
+    /// messages that arrived early for it.
+    fn enter_epoch(&mut self, now_ms: u64) -> Vec<Out> {
         self.epoch = self.chain.epoch;
+        self.epoch_genesis = consensus_genesis(&self.chain);
         self.replica = make_replica(&self.key, &self.chain, self.cfg);
         self.refill(now_ms);
         let mut out = self.replica.start(now_ms);
@@ -208,6 +267,83 @@ impl Node {
         let out = self.chain.apply_block(&block).expect("height and time are derived locally");
         self.app_hashes.push(out.app_hash);
         self.outcomes.push(out);
+    }
+
+    pub fn height(&self) -> u64 {
+        self.chain.height
+    }
+
+    pub fn sync_request(&self) -> SyncRequest {
+        SyncRequest { from_height: self.chain.height + 1 }
+    }
+
+    /// Serves committed blocks from `from_height` (within one epoch) with a
+    /// commit proof, or `None` if this node can't prove them yet.
+    pub fn serve_sync(&self, req: &SyncRequest) -> Option<SyncResponse> {
+        let start = (req.from_height as usize).checked_sub(1)?;
+        let (epoch, _) = self.committed.get(start)?;
+        let epoch = *epoch;
+        let end =
+            self.committed[start..].iter().position(|(e, _)| *e != epoch).map_or(self.committed.len(), |p| start + p);
+        let block = |i: usize| self.committed[i].1.clone();
+        let witness = if epoch < self.epoch {
+            self.epoch_tails.get(&epoch).map(|(tail, c, qc)| (tail.clone(), c.clone(), qc.clone()))
+        } else {
+            self.replica
+                .commit_witness()
+                .filter(|(c, _)| Some(c.parent()) == self.committed.last().map(|(_, b)| b.hash()))
+                .map(|(c, qc)| (Vec::new(), c.clone(), qc.clone()))
+        };
+        // Prefer a cut near SYNC_BATCH proven by its next two blocks.
+        let cut = (start..end.saturating_sub(2))
+            .rev()
+            .filter(|&k| k < start + SYNC_BATCH)
+            .chain(start + SYNC_BATCH..end.saturating_sub(2))
+            .find(|&k| self.committed[k + 1].1.round == self.committed[k].1.round + 1);
+        let (last, proof) = match (cut, witness) {
+            (_, Some((tail, certified, qc))) if end - start <= SYNC_BATCH => {
+                (end - 1, CommitProof::Witness { tail, certified, qc })
+            }
+            (Some(k), _) => (k, CommitProof::Children(block(k + 1), block(k + 2))),
+            (None, Some((tail, certified, qc))) => (end - 1, CommitProof::Witness { tail, certified, qc }),
+            (None, None) => return None,
+        };
+        Some(SyncResponse { epoch, from_height: req.from_height, blocks: (start..=last).map(block).collect(), proof })
+    }
+
+    /// Verifies a sync segment against the current epoch's validators and
+    /// applies it; consensus resumes from the new committed tip (or the next
+    /// epoch, if the segment crossed into it).
+    pub fn apply_sync(&mut self, resp: SyncResponse, now_ms: u64) -> Result<Vec<NetOut>, SyncError> {
+        if resp.epoch != self.epoch {
+            return Err(SyncError::WrongEpoch);
+        }
+        if resp.from_height != self.chain.height + 1 {
+            return Err(SyncError::WrongHeight);
+        }
+        let prev = match self.committed.last() {
+            Some((e, b)) if *e == self.epoch => b.hash(),
+            _ => self.epoch_genesis,
+        };
+        if !verify_committed_segment(&self.chain.validators, &self.epoch_genesis, &prev, &resp.blocks, &resp.proof) {
+            return Err(SyncError::BadProof);
+        }
+        for b in resp.blocks {
+            if self.chain.epoch != self.epoch {
+                break;
+            }
+            self.commit_block(b);
+        }
+        let outs = if self.chain.epoch != self.epoch {
+            self.enter_epoch(now_ms)
+        } else {
+            let safety = self.replica.safety_state();
+            let current: Vec<_> =
+                self.committed.iter().filter(|(e, _)| *e == self.epoch).map(|(_, b)| b.clone()).collect();
+            self.replica = make_replica(&self.key, &self.chain, self.cfg);
+            self.replica.restore(safety, &current, now_ms)
+        };
+        Ok(self.finish(outs, None))
     }
 
     fn index_of(&self, key: &Pubkey) -> NodeId {
