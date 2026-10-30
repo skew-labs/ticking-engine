@@ -1,0 +1,22 @@
+[package]
+name = "mee-chain"
+description = "MEE chain state machine: signed actions, blocks, bridge and HIP-3 governance"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mee-core = { path = "../mee-core" }
+mee-engine = { path = "../mee-engine" }
+borsh.workspace = true
+bytemuck.workspace = true
+ed25519-dalek.workspace = true
+rustc-hash.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+
+[[bench]]
+name = "chain"
+harness = false

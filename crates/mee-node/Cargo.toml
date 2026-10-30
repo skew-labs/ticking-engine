@@ -1,0 +1,18 @@
+[package]
+name = "mee-node"
+description = "MEE validator node: BFT consensus driving the chain state machine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mee-chain = { path = "../mee-chain" }
+mee-consensus = { path = "../mee-consensus" }
+borsh.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+mee-core = { path = "../mee-core" }
+mee-engine = { path = "../mee-engine" }

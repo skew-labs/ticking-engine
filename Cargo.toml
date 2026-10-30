@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/mee-core", "crates/mee-engine", "crates/mee-chain", "crates/mee-consensus", "crates/mee-node", "crates/mee-net", "programs/mee"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+bytemuck = { version = "1.25", features = ["derive", "min_const_generics", "extern_crate_alloc"] }
+borsh = { version = "1.5", features = ["derive"] }
+rustc-hash = "2"
+ed25519-dalek = { version = "2.2", features = ["rand_core", "batch"] }
+sha2 = { version = "0.10", features = ["compress"] }
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+# Crypto is unbearably slow unoptimized; keep debug test runs quick.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3

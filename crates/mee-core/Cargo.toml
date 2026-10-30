@@ -1,0 +1,10 @@
+[package]
+name = "mee-core"
+description = "Matching, margin, liquidation, funding and settlement engine for MEE perp DEXes"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
