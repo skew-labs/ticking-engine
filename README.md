@@ -9,10 +9,10 @@
 | 구성 | 경로 | 설명 |
 |---|---|---|
 | CEX급 엔진 | [`crates/mee-engine`](crates/mee-engine) | 오더북, 증거금/청산/펀딩 TWAP/ADL, 여러 DEX, 머클 상태 커밋먼트. 단일 스레드 약 173만 ops/s |
-| 체인 상태 머신 | [`crates/mee-chain`](crates/mee-chain) | 서명 트랜잭션, 취소 우선 블록 순서, 브릿지, 런치 상장/오라클, 스테이킹/에폭, 계정 증명. 4코어 약 12만 tx/s |
+| 체인 상태 머신 | [`crates/mee-chain`](crates/mee-chain) | 서명 트랜잭션, 취소 우선 블록 순서, 정정·배치·TP/SL, 브릿지, 런치 상장/오라클, 가중치 스테이킹·슬래싱, 계정 증명. 4코어 약 12만 tx/s |
 | BFT 합의 | [`crates/mee-consensus`](crates/mee-consensus) | HotStuff 2-chain (Jolteon식), 리더 평판, 커밋 증명, 장애 시뮬레이터 |
-| 검증인 노드 | [`crates/mee-node`](crates/mee-node) | 합의 → 체인, 디스크 영속성/크래시 복구, 에폭 전환, 검증된 상태 동기화 |
-| 네트워크 + API | [`crates/mee-net`](crates/mee-net) | 인증 TCP P2P, 가십, 동기화, HTTP/JSON + WebSocket, `mee-validator` 바이너리 |
+| 검증인 노드 | [`crates/mee-node`](crates/mee-node) | 합의 → 체인, 디스크 영속성/크래시 복구, 검증된 스냅샷, 에폭 전환, 이중 투표 증거, 검증된 상태 동기화 |
+| 네트워크 + 운영 | [`crates/mee-net`](crates/mee-net) | 암호화·인증 P2P, 가십, 동기화, HTTP/JSON + WebSocket, 솔라나 입금 자동 증명, 출금 릴레이어, `mee-validator`/`mee-relayer` |
 | 솔라나 프로그램 | [`programs/mee`](programs/mee) | 브릿지(입금, 출금 승인 + 이의제기 기간 + 잠금, 검증인 교체), 런치패드(본딩커브, 졸업, TWAP AMM), 온체인 HIP-3 DEX |
 | 공용/온체인 엔진 | [`crates/mee-core`](crates/mee-core) | 공용 수학, 파라미터, 고정 크기 온체인 엔진 |
 | 설계 문서 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 구조, 측정값, 프로토콜 규칙, 회계 공식, 한계 |
@@ -28,6 +28,12 @@ cargo bench -p mee-chain    # 서명 검증 포함 체인 처리량
 cargo build --release -p mee-net
 for i in 0 1 2 3; do ./target/release/mee-validator --index $i --data ./data & done
 curl localhost:8600/status
+
+# 실제 네트워크: 키, 제네시스, 설정 파일로 실행
+mee-validator keygen --out validator.json
+mee-validator genesis --chain-id 1 --bridge <브릿지 프로그램> --validators <키1>,<키2>,... --out genesis.json
+mee-validator run --config node.json
+mee-relayer --rpc <솔라나 RPC> --program <브릿지 프로그램> --keypair payer.json --validators http://v1:8600,...
 ```
 
 툴체인은 `rust-toolchain.toml`(1.97.0)에 고정돼 있다. 아직 프로토타입이고 감사 전이다. 남은 일은 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#13-한계와-다음-단계)에 정리했다.
