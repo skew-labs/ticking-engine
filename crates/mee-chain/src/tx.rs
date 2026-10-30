@@ -154,8 +154,8 @@ pub enum Action {
     },
     /// Up to `MAX_BATCH` actions in one signed transaction, run in order.
     /// Each stands on its own: one failing doesn't undo the others (the
-    /// result reports how many failed). No nesting.
-    Batch(Vec<Action>),
+    /// result reports how many failed). No nesting (refused while decoding).
+    Batch(BatchActions),
     /// Take-profit / stop-loss. Once the mark price is at or beyond
     /// `trigger_price` (at or above it if `above`, else at or below), an
     /// immediate-or-cancel order for `size` with worst price `limit_price` is
@@ -176,6 +176,51 @@ pub enum Action {
 
 /// Most actions in one `Action::Batch`.
 pub const MAX_BATCH: usize = 32;
+
+/// The actions of a batch. Decoding refuses a nested batch and more than
+/// `MAX_BATCH` items before reading them, so untrusted bytes (API, gossip,
+/// proposals) can't recurse deeply and overflow the stack.
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize)]
+pub struct BatchActions(pub Vec<Action>);
+
+impl std::ops::Deref for BatchActions {
+    type Target = Vec<Action>;
+    fn deref(&self) -> &Vec<Action> {
+        &self.0
+    }
+}
+
+impl From<Vec<Action>> for BatchActions {
+    fn from(v: Vec<Action>) -> Self {
+        BatchActions(v)
+    }
+}
+
+/// Borsh tag of `Action::Batch`.
+fn batch_tag() -> u8 {
+    borsh::to_vec(&Action::Batch(BatchActions(Vec::new()))).expect("borsh")[0]
+}
+
+impl BorshDeserialize for BatchActions {
+    fn deserialize_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
+        use borsh::de::EnumExt as _;
+        let invalid = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        let n = u32::deserialize_reader(r)? as usize;
+        if n > MAX_BATCH {
+            return Err(invalid("batch too long"));
+        }
+        let nested = batch_tag();
+        let mut items = Vec::with_capacity(n);
+        for _ in 0..n {
+            let tag = u8::deserialize_reader(r)?;
+            if tag == nested {
+                return Err(invalid("nested batch"));
+            }
+            items.push(Action::deserialize_variant(r, tag)?);
+        }
+        Ok(BatchActions(items))
+    }
+}
 
 impl Action {
     /// Block ordering class: cancels run first, then post-only orders, then

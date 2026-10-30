@@ -67,33 +67,40 @@ pub struct SignedFact {
     pub signature: Sig,
 }
 
-/// Attestations collected so far, by fact then signer.
+/// Attestations collected so far: per deposit id, each validator's first
+/// signed fact. One entry per (id, validator) bounds memory at
+/// `POOL_WINDOW` × validators, whatever a misbehaving validator sends.
 #[derive(Default)]
 pub struct Pool {
-    facts: BTreeMap<Fact, BTreeMap<Pubkey, Sig>>,
+    by_id: BTreeMap<u64, BTreeMap<Pubkey, (Fact, Sig)>>,
 }
 
 impl Pool {
     /// Adds a verified attestation; returns the system transaction once the
     /// fact has a quorum under the current set.
     pub fn add(&mut self, chain: &Chain, s: SignedFact) -> Option<Tx> {
-        let next = chain.next_deposit_id;
-        if s.fact.id() < next || s.fact.id() > next + POOL_WINDOW || !chain.validators.contains(&s.validator) {
+        let (id, next) = (s.fact.id(), chain.next_deposit_id);
+        if id < next || id > next + POOL_WINDOW || !chain.validators.contains(&s.validator) {
             return None;
+        }
+        let signers = self.by_id.entry(id).or_default();
+        if signers.contains_key(&s.validator) {
+            return None; // first fact per validator wins; no re-verification work
         }
         if !crypto::verify(&s.validator, &s.fact.message(chain), &s.signature) {
             return None;
         }
-        let signers = self.facts.entry(s.fact.clone()).or_default();
-        signers.insert(s.validator, s.signature);
+        signers.insert(s.validator, (s.fact.clone(), s.signature));
         Self::build(chain, &s.fact, signers)
     }
 
-    fn build(chain: &Chain, fact: &Fact, signers: &BTreeMap<Pubkey, Sig>) -> Option<Tx> {
+    fn build(chain: &Chain, fact: &Fact, signers: &BTreeMap<Pubkey, (Fact, Sig)>) -> Option<Tx> {
         let mut weight = 0u128;
         let mut attestations = Vec::new();
         for (i, (v, w)) in chain.validators.iter().zip(&chain.validator_weights).enumerate() {
-            if let Some(sig) = signers.get(v) {
+            if let Some((f, sig)) = signers.get(v)
+                && f == fact
+            {
                 weight += *w as u128;
                 attestations.push(Attestation { validator: i as u16, signature: *sig });
             }
@@ -112,20 +119,28 @@ impl Pool {
         })
     }
 
-    /// Drops facts the chain has moved past; returns transactions for facts
-    /// that have a quorum (e.g. again after a validator-set change).
+    /// Drops ids the chain has moved past; returns transactions for the next
+    /// few ids whose fact has a quorum (e.g. again after a set change).
     pub fn refresh(&mut self, chain: &Chain) -> Vec<Tx> {
         let next = chain.next_deposit_id;
-        self.facts.retain(|f, _| f.id() >= next);
-        self.facts.iter().filter_map(|(f, s)| Self::build(chain, f, s)).collect()
+        self.by_id.retain(|id, _| *id >= next);
+        let mut out = Vec::new();
+        for (_, signers) in self.by_id.range(next..next + LOOKAHEAD) {
+            let mut facts: Vec<&Fact> = signers.values().map(|(f, _)| f).collect();
+            facts.sort();
+            facts.dedup();
+            out.extend(facts.into_iter().filter_map(|f| Self::build(chain, f, signers)));
+        }
+        out
     }
 
+    /// Number of (id, validator) entries held.
     pub fn len(&self) -> usize {
-        self.facts.len()
+        self.by_id.values().map(BTreeMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.facts.is_empty()
+        self.by_id.is_empty()
     }
 }
 
@@ -203,4 +218,38 @@ pub async fn read_deposit(rpc: &Rpc, bridge: &Pubkey, id: u64) -> Result<Option<
 
 fn solana_pubkey(k: &Pubkey) -> mee::solana_program::pubkey::Pubkey {
     mee::solana_program::pubkey::Pubkey::new_from_array(*k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{devnet_genesis, devnet_key};
+
+    #[test]
+    fn a_spamming_validator_holds_one_entry_per_id_and_quorum_still_forms() {
+        let chain = Chain::new(devnet_genesis(5, 4));
+        let mut pool = Pool::default();
+        let sign = |i: u32, f: &Fact| SignedFact {
+            fact: f.clone(),
+            validator: crypto::pubkey(&devnet_key(i)),
+            signature: crypto::sign(&devnet_key(i), &f.message(&chain)),
+        };
+        let real = Fact::Deposit { id: 0, owner: [1; 32], asset: 0, amount: 100 };
+        // Validator 3 floods variants of deposit 0 (and junk past the window).
+        for amount in 0..1_000 {
+            let fake = Fact::Deposit { id: 0, owner: [9; 32], asset: 0, amount };
+            assert!(pool.add(&chain, sign(3, &fake)).is_none());
+        }
+        let far = Fact::Deposit { id: 1_000_000, owner: [9; 32], asset: 0, amount: 1 };
+        assert!(pool.add(&chain, sign(3, &far)).is_none());
+        assert_eq!(pool.len(), 1, "one entry for validator 3");
+        // The honest three still reach a quorum (3 of 4) on the real deposit.
+        assert!(pool.add(&chain, sign(0, &real)).is_none());
+        assert!(pool.add(&chain, sign(1, &real)).is_none());
+        let tx = pool.add(&chain, sign(2, &real)).expect("quorum");
+        let Tx::System(SystemTx::BridgeDeposit { attestations, amount, .. }) = &tx else { panic!() };
+        assert_eq!((attestations.len(), *amount), (3, 100));
+        assert!(chain.check_tx(&tx).is_ok());
+        assert_eq!(pool.len(), 4);
+    }
 }

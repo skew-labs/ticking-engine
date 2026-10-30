@@ -125,14 +125,12 @@ pub fn valset_message(chain_id: u64, bridge: &Pubkey, nonce: u64, validators: &[
 }
 
 /// Genesis hash of the consensus instance that runs epoch `epoch`
-/// (`app_hash` = the chain's app hash right after the block that started it).
-/// Every consensus signature carries it, which ties votes to one epoch.
+/// (`app_hash` = the chain's app hash right after the block that started it;
+/// for epoch 0 the hash of the whole genesis). Every consensus signature
+/// carries it, which ties votes to one epoch of one network: a relaunch or a
+/// testnet reusing the chain id and keys signs under a different domain.
 pub fn consensus_genesis(chain_id: u64, epoch: u64, app_hash: &Hash) -> Hash {
-    if epoch == 0 {
-        sha256(&[b"MEE/consensus-genesis", &chain_id.to_le_bytes()])
-    } else {
-        sha256(&[b"MEE/epoch-genesis", &chain_id.to_le_bytes(), &epoch.to_le_bytes(), app_hash])
-    }
+    sha256(&[b"MEE/epoch-genesis", &chain_id.to_le_bytes(), &epoch.to_le_bytes(), app_hash])
 }
 
 /// A consensus vote as validators sign it. Must match

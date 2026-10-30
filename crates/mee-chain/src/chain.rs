@@ -38,6 +38,66 @@ pub struct Trigger {
     pub reduce_only: bool,
 }
 
+/// Triggers sorted by market and price, plus a count per account.
+#[derive(Clone, Debug, Default)]
+struct TriggerIndex {
+    /// (market, trigger price, id) of triggers that fire at or above.
+    above: std::collections::BTreeSet<(MarketId, u64, u64)>,
+    /// Same for those that fire at or below.
+    below: std::collections::BTreeSet<(MarketId, u64, u64)>,
+    per_account: std::collections::BTreeMap<AccountId, usize>,
+}
+
+impl TriggerIndex {
+    fn add(&mut self, id: u64, t: &Trigger) {
+        let set = if t.above { &mut self.above } else { &mut self.below };
+        set.insert((t.market, t.trigger_price, id));
+        *self.per_account.entry(t.account).or_insert(0) += 1;
+    }
+
+    fn remove(&mut self, id: u64, t: &Trigger) {
+        let set = if t.above { &mut self.above } else { &mut self.below };
+        set.remove(&(t.market, t.trigger_price, id));
+        if let Some(n) = self.per_account.get_mut(&t.account) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_account.remove(&t.account);
+            }
+        }
+    }
+
+    fn count(&self, a: AccountId) -> usize {
+        self.per_account.get(&a).copied().unwrap_or(0)
+    }
+
+    /// Markets with at least one trigger.
+    fn markets(&self) -> impl Iterator<Item = MarketId> + '_ {
+        let mut ms: Vec<MarketId> = Vec::new();
+        for set in [&self.above, &self.below] {
+            let mut next = set.first().map(|k| k.0);
+            while let Some(m) = next {
+                ms.push(m);
+                next = m.checked_add(1).and_then(|n| set.range((n, 0, 0)..).next()).map(|k| k.0);
+            }
+        }
+        ms.sort_unstable();
+        ms.dedup();
+        ms.into_iter()
+    }
+
+    /// Ids whose condition `mark` meets.
+    fn reached(&self, m: MarketId, mark: u64) -> Vec<u64> {
+        let up = self.above.range((m, 0, 0)..=(m, mark, u64::MAX)).map(|k| k.2);
+        let down = self.below.range((m, mark, 0)..=(m, u64::MAX, u64::MAX)).map(|k| k.2);
+        up.chain(down).collect()
+    }
+
+    fn all_in(&self, m: MarketId) -> Vec<u64> {
+        let r = (m, 0, 0)..=(m, u64::MAX, u64::MAX);
+        self.above.range(r.clone()).chain(self.below.range(r)).map(|k| k.2).collect()
+    }
+}
+
 /// Share of a double-signing validator's stake (and its delegators') that is
 /// burned.
 pub const EQUIVOCATION_SLASH_BPS: u64 = 500;
@@ -232,13 +292,64 @@ pub struct Chain {
     /// Set while applying a block that slashed someone (forces an election).
     pub(crate) slashed_in_block: bool,
     pub triggers: std::collections::BTreeMap<u64, Trigger>,
+    /// Lookup structures over `triggers` (derived, rebuilt on load).
+    trigger_index: TriggerIndex,
     pub next_trigger_id: u64,
+    /// Hash chain over `epochs` (so committing them costs O(1) per block).
+    pub epochs_hash: Hash,
+    /// `staking_hash()` as of the last change (recomputed only when a
+    /// staking/trigger field changed, not every block).
+    staking_cache: Option<Hash>,
     /// Voting weight of each validator (same order as `validators`): its
     /// stake at the election, or the genesis weight.
     pub validator_weights: Vec<u64>,
     /// Keys that proved control (`RegisterValidator`): only these can be
     /// elected.
     pub registered: std::collections::BTreeSet<Pubkey>,
+}
+
+/// One link of the hash chain over epoch records (length-prefixed members).
+pub fn epoch_link(prev: &Hash, epoch: u64, genesis: &Hash, members: &[Pubkey]) -> Hash {
+    let mut buf = Vec::with_capacity(48 + 32 * members.len());
+    buf.extend_from_slice(&epoch.to_le_bytes());
+    buf.extend_from_slice(genesis);
+    buf.extend_from_slice(&(members.len() as u64).to_le_bytes());
+    for m in members {
+        buf.extend_from_slice(m);
+    }
+    crypto::sha256(&[b"MEE/epoch", prev, &buf])
+}
+
+/// Hash of everything in a genesis: the chain's first app hash and the root
+/// of epoch 0's consensus domain.
+pub fn genesis_hash(g: &Genesis) -> Hash {
+    let (l, s) = (&g.launch, &g.staking);
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&g.chain_id.to_le_bytes());
+    buf.extend_from_slice(&g.bridge_program);
+    buf.extend_from_slice(&g.timestamp_ms.to_le_bytes());
+    buf.extend_from_slice(bytemuck::bytes_of(&g.params));
+    buf.extend_from_slice(&(g.validators.len() as u64).to_le_bytes());
+    for v in &g.validators {
+        buf.extend_from_slice(v);
+    }
+    for x in [
+        l.initial_margin_bps,
+        l.maintenance_margin_bps,
+        l.liquidation_fee_bps,
+        l.max_funding_bps,
+        l.creator_fee_share_bps,
+        l.oi_cap_ratio_bps,
+        l.min_lot_value,
+        s.epoch_blocks,
+        s.max_validators as u64,
+        s.min_validator_stake,
+    ] {
+        buf.extend_from_slice(&x.to_le_bytes());
+    }
+    buf.extend_from_slice(&l.funding_interval.to_le_bytes());
+    buf.extend_from_slice(&s.unbond_secs.to_le_bytes());
+    crypto::sha256(&[b"MEE/genesis", &buf])
 }
 
 impl Chain {
@@ -252,7 +363,7 @@ impl Chain {
             state,
             height: 0,
             timestamp_ms: g.timestamp_ms,
-            app_hash: crypto::sha256(&[b"MEE/genesis", &g.chain_id.to_le_bytes()]),
+            app_hash: genesis_hash(&g),
             state_root: [0; 32],
             withdrawals_hash: [0; 32],
             listings_hash: [0; 32],
@@ -269,12 +380,20 @@ impl Chain {
             stakes: g.validators.iter().map(|v| (*v, g.staking.min_validator_stake)).collect(),
             delegations: Default::default(),
             unbonding: Vec::new(),
-            epochs: [(0, (crypto::consensus_genesis(g.chain_id, 0, &[0; 32]), g.validators.clone()))].into(),
+            epochs: [(0, (crypto::consensus_genesis(g.chain_id, 0, &genesis_hash(&g)), g.validators.clone()))].into(),
             tombstoned: Default::default(),
             slashed_validator_stake: 0,
             slashed_in_block: false,
             triggers: Default::default(),
+            trigger_index: Default::default(),
             next_trigger_id: 0,
+            epochs_hash: epoch_link(
+                &[0; 32],
+                0,
+                &crypto::consensus_genesis(g.chain_id, 0, &genesis_hash(&g)),
+                &g.validators,
+            ),
+            staking_cache: None,
             validator_weights: vec![g.staking.min_validator_stake.max(1); g.validators.len()],
             registered: g.validators.iter().copied().collect(),
         }
@@ -447,19 +566,35 @@ impl Chain {
         // A slashed validator leaves the set right away, not at the next
         // scheduled election.
         let slashed = std::mem::take(&mut self.slashed_in_block);
-        if (e > 0 && self.height.is_multiple_of(e)) || slashed {
-            let next = self.elect();
+        let scheduled = e > 0 && self.height.is_multiple_of(e);
+        if scheduled || slashed {
             let mut current = self.committee();
             current.sort();
+            // A slash outside a scheduled election only removes the slashed
+            // keys; everyone else keeps their seat and weight (a full
+            // re-election here would let fresh stake take over a set that is
+            // meant to be fixed, on demand of whoever gets slashed).
+            let next = if scheduled {
+                self.elect()
+            } else {
+                let rest: Vec<(Pubkey, u64)> =
+                    current.iter().filter(|(k, _)| !self.tombstoned.contains(k)).copied().collect();
+                if rest.is_empty() { current.clone() } else { rest }
+            };
             // Same members and weights in another order is not a change.
             if next != current {
                 self.validators = next.iter().map(|(k, _)| *k).collect();
                 self.validator_weights = next.iter().map(|(_, w)| *w).collect();
                 self.epoch += 1;
+                self.staking_cache = None;
                 out.validator_set = Some((self.epoch, next));
             }
         }
 
+        if self.staking_cache.is_none() {
+            self.staking_cache = Some(self.staking_hash());
+        }
+        debug_assert_eq!(self.staking_cache, Some(self.staking_hash()), "a staking change missed the cache");
         let roots = self.state.commit();
         self.state_root = crypto::sha256(&[b"MEE/chain-state", &roots.root, &self.globals_hash()]);
         out.state_root = self.state_root;
@@ -481,7 +616,9 @@ impl Chain {
         out.app_hash = h;
         if out.validator_set.is_some() {
             let genesis = crypto::consensus_genesis(self.chain_id, self.epoch, &self.app_hash);
+            self.epochs_hash = epoch_link(&self.epochs_hash, self.epoch, &genesis, &self.validators);
             self.epochs.insert(self.epoch, (genesis, self.validators.clone()));
+            self.staking_cache = None;
         }
         Ok(out)
     }
@@ -629,6 +766,7 @@ impl Chain {
     /// (unbonding included: leaving doesn't dodge the penalty) and bars the
     /// key for good.
     fn slash_validator(&mut self, v: &Pubkey) {
+        self.staking_cache = None;
         let cut = |x: u64| (x as u128 * EQUIVOCATION_SLASH_BPS as u128).div_ceil(10_000) as u64;
         let mut burned = 0u64;
         let mut from_stake = 0u64;
@@ -665,24 +803,26 @@ impl Chain {
         if self.triggers.is_empty() {
             return;
         }
-        let mut marks: Vec<Option<u64>> = vec![None; self.state.markets.len()];
-        let ids: Vec<u64> = self.triggers.keys().copied().collect();
-        for id in ids {
-            let t = self.triggers[&id];
-            let Ok(m) = self.state.market(t.market) else {
-                self.triggers.remove(&id);
-                continue;
-            };
-            if m.status != mee_core::MARKET_ACTIVE {
-                self.triggers.remove(&id); // halted or settled: nothing left to protect
+        // Per market, the triggers the mark has reached are a range of each
+        // price-sorted index: O(markets + fired), not O(triggers).
+        let mut due = Vec::new();
+        let markets: Vec<MarketId> = self.trigger_index.markets().collect();
+        for m in markets {
+            let Ok(market) = self.state.market(m) else { continue };
+            if market.status != mee_core::MARKET_ACTIVE {
+                due.extend(self.trigger_index.all_in(m)); // nothing left to protect
                 continue;
             }
-            let mark = *marks[t.market as usize].get_or_insert_with(|| self.state.mark_price(m));
-            let hit = if t.above { mark >= t.trigger_price } else { mark <= t.trigger_price };
-            if !hit {
+            let mark = self.state.mark_price(market);
+            due.extend(self.trigger_index.reached(m, mark));
+        }
+        due.sort_unstable();
+        for id in due {
+            let Some(t) = self.remove_trigger(id) else { continue };
+            let active = self.state.market(t.market).is_ok_and(|m| m.status == mee_core::MARKET_ACTIVE);
+            if !active {
                 continue;
             }
-            self.triggers.remove(&id);
             let req = OrderRequest {
                 market: t.market,
                 side: t.side,
@@ -697,6 +837,19 @@ impl Chain {
         }
     }
 
+    pub(crate) fn add_trigger(&mut self, id: u64, t: Trigger) {
+        self.trigger_index.add(id, &t);
+        self.triggers.insert(id, t);
+        self.staking_cache = None;
+    }
+
+    fn remove_trigger(&mut self, id: u64) -> Option<Trigger> {
+        let t = self.triggers.remove(&id)?;
+        self.trigger_index.remove(id, &t);
+        self.staking_cache = None;
+        Some(t)
+    }
+
     fn release_unbonded(&mut self) {
         let now = self.timestamp_ms / 1_000;
         let (e, height) = (self.staking.epoch_blocks, self.height);
@@ -706,6 +859,9 @@ impl Chain {
         let (ready, wait): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.unbonding).into_iter().partition(|u| u.0 <= now && past_election(u.1));
         self.unbonding = wait;
+        if !ready.is_empty() {
+            self.staking_cache = None;
+        }
         for (_, _, a, _, amount) in ready {
             let acct = &mut self.state.accounts[a as usize];
             acct.stake_balance = acct.stake_balance.saturating_add(amount);
@@ -736,13 +892,7 @@ impl Chain {
         }
         buf.extend_from_slice(&self.slashed_validator_stake.to_le_bytes());
         buf.extend_from_slice(b"epochs");
-        for (e, (genesis, members)) in &self.epochs {
-            buf.extend_from_slice(&e.to_le_bytes());
-            buf.extend_from_slice(genesis);
-            for m in members {
-                buf.extend_from_slice(m);
-            }
-        }
+        buf.extend_from_slice(&self.epochs_hash);
         buf.extend_from_slice(b"triggers");
         buf.extend_from_slice(&self.next_trigger_id.to_le_bytes());
         for (id, t) in &self.triggers {
@@ -768,7 +918,7 @@ impl Chain {
     /// Chain-level values outside the engine state.
     pub fn globals_hash(&self) -> Hash {
         crypto::sha256(&[
-            &self.staking_hash(),
+            &self.staking_cache.unwrap_or_else(|| self.staking_hash()),
             b"MEE/chain-globals",
             &self.height.to_le_bytes(),
             &self.timestamp_ms.to_le_bytes(),
@@ -803,6 +953,16 @@ impl Chain {
     }
 
     fn execute_action(&mut self, signer: &Pubkey, action: &Action, out: &mut BlockOutcome) -> Result<(), TxError> {
+        if matches!(
+            action,
+            Action::Delegate { .. }
+                | Action::Undelegate { .. }
+                | Action::RegisterValidator
+                | Action::PlaceTrigger { .. }
+                | Action::CancelTrigger { .. }
+        ) {
+            self.staking_cache = None;
+        }
         let r: EngineResult<()> = match action {
             Action::PlaceOrder { market, side, kind, price, size, reduce_only, client_id } => {
                 let a = self.account(signer)?;
@@ -842,8 +1002,14 @@ impl Chain {
                 if *trigger_price == 0 || *limit_price == 0 || *size == 0 {
                     return Err(TxError::BadAction);
                 }
-                let mine = self.triggers.values().filter(|t| t.account == a).count();
-                if mine >= MAX_TRIGGERS_PER_ACCOUNT || self.triggers.len() >= MAX_TRIGGERS {
+                // TP/SL protect a position: reduce-only, and only with one open
+                // (so trigger slots can't be squatted for free).
+                let dex = self.state.market(*market)?.dex;
+                let open = self.state.accounts[a as usize].margin(dex).is_some_and(|mg| mg.position(*market).base != 0);
+                if !*reduce_only || !open {
+                    return Err(TxError::BadAction);
+                }
+                if self.trigger_index.count(a) >= MAX_TRIGGERS_PER_ACCOUNT || self.triggers.len() >= MAX_TRIGGERS {
                     return Err(TxError::TooManyTriggers);
                 }
                 let t = Trigger {
@@ -856,7 +1022,7 @@ impl Chain {
                     size: *size,
                     reduce_only: *reduce_only,
                 };
-                self.triggers.insert(self.next_trigger_id, t);
+                self.add_trigger(self.next_trigger_id, t);
                 self.next_trigger_id += 1;
                 Ok(())
             }
@@ -864,7 +1030,7 @@ impl Chain {
                 let a = self.account(signer)?;
                 match self.triggers.get(id) {
                     Some(t) if t.account == a => {
-                        self.triggers.remove(id);
+                        self.remove_trigger(*id);
                         Ok(())
                     }
                     _ => return Err(TxError::UnknownTrigger),

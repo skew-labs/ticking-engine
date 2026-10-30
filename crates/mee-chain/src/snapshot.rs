@@ -176,10 +176,13 @@ impl Chain {
         c.delegations = s.delegations.into_iter().collect();
         c.unbonding = s.unbonding;
         c.epochs = s.epochs.into_iter().collect();
+        c.epochs_hash = c.epochs.iter().fold([0u8; 32], |h, (e, (g, m))| crate::chain::epoch_link(&h, *e, g, m));
         c.tombstoned = s.tombstoned.into_iter().collect();
         c.slashed_validator_stake = s.slashed_validator_stake;
         c.slashed_in_block = false;
-        c.triggers = triggers;
+        for (id, t) in triggers {
+            c.add_trigger(id, t);
+        }
         c.next_trigger_id = s.next_trigger_id;
         c.registered = s.registered.into_iter().collect();
         if !c.epochs.contains_key(&c.epoch) {

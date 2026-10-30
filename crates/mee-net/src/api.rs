@@ -57,8 +57,13 @@ impl RateLimit {
         let now = Instant::now();
         let burst = 2.0 * self.per_sec;
         let mut b = self.buckets.lock().unwrap();
-        if b.len() > 100_000 {
+        if b.len() > 100_000 && !b.contains_key(&ip) {
             b.retain(|_, (_, t)| now.duration_since(*t).as_secs() < 60);
+            // Still full of active clients: refuse newcomers rather than
+            // rescanning the table on every request.
+            if b.len() > 100_000 {
+                return false;
+            }
         }
         let (tokens, last) = b.entry(ip).or_insert((burst, now));
         *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * self.per_sec).min(burst);
@@ -430,6 +435,10 @@ pub fn event_json(e: &Event) -> Value {
         Event::MarketAdded { dex, market } => json!({ "type": "market_added", "dex": dex, "market": market }),
         Event::Slashed { dex, amount, frozen } => {
             json!({ "type": "slashed", "dex": dex, "amount": amount, "frozen": frozen })
+        }
+        Event::Reduced { market, order_id, account, remaining } => {
+            json!({ "type": "reduced", "market": market, "order_id": order_id, "account": account,
+                    "remaining": remaining })
         }
         Event::Adl { market, target, counterparty, size, price } => {
             json!({ "type": "adl", "market": market, "target": target, "counterparty": counterparty,

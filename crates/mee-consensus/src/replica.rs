@@ -423,7 +423,10 @@ impl Replica {
     /// Remembers a verified vote; a different block for the same round and
     /// voter is equivocation.
     fn witness_vote(&mut self, voter: NodeId, round: Round, block: Hash, sig: Sig, out: &mut Vec<Out>) {
-        if voter as usize >= self.validators.len() || round + EVIDENCE_WINDOW < self.round {
+        if voter as usize >= self.validators.len()
+            || round + EVIDENCE_WINDOW < self.round
+            || round > self.round + EVIDENCE_WINDOW
+        {
             return;
         }
         match self.seen_votes.get(&(round, voter)) {
@@ -512,6 +515,7 @@ impl Replica {
             || !self.is_validator()
             || self.leader(v.round + 1) != self.id
             || v.round + 1 < self.round
+            || v.round > self.round + EVIDENCE_WINDOW
             || !verify(&self.validators.keys[i], &vote_message(&self.genesis, &v.block, v.round), &v.signature)
         {
             return;

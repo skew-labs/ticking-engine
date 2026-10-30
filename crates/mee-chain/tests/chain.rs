@@ -491,6 +491,15 @@ fn stop_loss_fires_on_the_mark_and_batches_report_partial_failure() {
         size: 10,
         reduce_only: true,
     };
+    // Triggers protect a position: none without one, and only reduce-only.
+    let squat = net.tx(&dep, stop.clone());
+    assert_eq!(net.block(vec![squat]).results, vec![Err(TxError::BadAction)]);
+    let Action::PlaceTrigger { market, side, above, trigger_price, limit_price, size, .. } = stop.clone() else {
+        unreachable!()
+    };
+    let entry = Action::PlaceTrigger { market, side, above, trigger_price, limit_price, size, reduce_only: false };
+    let t = net.tx(&a, entry);
+    assert_eq!(net.block(vec![t]).results, vec![Err(TxError::BadAction)]);
     let txs = vec![net.tx(&a, stop), net.tx(&a, tp), net.tx(&b, order(0, 0, 1, PRICE - 300, 10))];
     net.ok(txs);
     assert_eq!(net.chain.triggers.len(), 2);
@@ -512,22 +521,36 @@ fn stop_loss_fires_on_the_mark_and_batches_report_partial_failure() {
     assert!(net.chain.triggers.is_empty());
 
     // A batch: two good orders and a bad one; the good ones stand.
-    let batch = Action::Batch(vec![
+    let batch = Action::Batch(BatchActions(vec![
         order(0, 1, 1, PRICE + 50, 1),
         order(0, 1, 1, 0, 1), // price 0: rejected
         order(0, 1, 1, PRICE + 60, 1),
-    ]);
+    ]));
     assert_eq!(batch.priority(), 2, "all post-only: the post-only class");
     let t = net.tx(&a, batch);
     let out = net.block(vec![t]);
     assert_eq!(out.results, vec![Err(TxError::PartialBatch { failed: 1 })]);
     assert_eq!(net.chain.state.markets[0].book.depth(mee_core::Side::Ask, 5), vec![(PRICE + 50, 1), (PRICE + 60, 1)]);
     // Bundling a cancel with a taker order doesn't move it into the cancel class.
-    let mixed = Action::Batch(vec![Action::CancelAll { market: 0 }, order(0, 0, 2, PRICE, 1)]);
+    let mixed = Action::Batch(BatchActions(vec![Action::CancelAll { market: 0 }, order(0, 0, 2, PRICE, 1)]));
     assert_eq!(mixed.priority(), 3);
-    let nested = Action::Batch(vec![Action::Batch(vec![])]);
-    let t = net.tx(&a, nested);
+    let nested = Action::Batch(BatchActions(vec![Action::Batch(BatchActions(vec![]))]));
+    let t = net.tx(&a, nested.clone());
     assert_eq!(net.block(vec![t]).results, vec![Err(TxError::BadAction)]);
+    // Untrusted bytes can't even decode a nested batch, however deep: no
+    // recursion, so no stack overflow.
+    use borsh::BorshDeserialize;
+    assert!(Action::try_from_slice(&borsh::to_vec(&nested).unwrap()).is_err());
+    let tag = borsh::to_vec(&Action::Batch(BatchActions(vec![]))).unwrap()[0];
+    let mut deep = Vec::new();
+    for _ in 0..200_000 {
+        deep.push(tag);
+        deep.extend_from_slice(&1u32.to_le_bytes());
+    }
+    assert!(Action::try_from_slice(&deep).is_err());
+    let mut long = vec![tag];
+    long.extend_from_slice(&(MAX_BATCH as u32 + 1).to_le_bytes());
+    assert!(Action::try_from_slice(&long).is_err(), "too many items refused before reading them");
 }
 
 #[test]
@@ -594,4 +617,69 @@ fn snapshot_restores_a_chain_that_continues_identically() {
             assert!((at_hash..at_hash + 32).contains(&at), "tampered byte {at} accepted");
         }
     }
+}
+
+#[test]
+fn a_slash_only_removes_the_offender_and_never_reelects() {
+    // Fixed genesis set (no scheduled elections). Outsiders stake and
+    // register; then a genesis validator double-signs on purpose.
+    let mut net = Net::new();
+    let outsiders: Vec<SigningKey> = (50..54).map(key).collect();
+    let mut txs = Vec::new();
+    for o in &outsiders {
+        txs.push(net.deposit_tx(o, ASSET_STAKE, 1_000));
+    }
+    net.ok(txs);
+    let mut txs = Vec::new();
+    for o in &outsiders {
+        let k = crypto::pubkey(o);
+        txs.push(net.tx(o, Action::RegisterValidator));
+        txs.push(net.tx(o, Action::Delegate { validator: k, amount: 1_000 }));
+    }
+    net.ok(txs);
+    let bad = net.validators[0].clone();
+    let domain = net.chain.consensus_genesis();
+    let vote = |b: [u8; 32]| crypto::sign(&bad, &crypto::consensus_vote_message(&domain, &b, 3));
+    let ev = Tx::System(SystemTx::Evidence {
+        epoch: 0,
+        validator: crypto::pubkey(&bad),
+        round: 3,
+        block_a: [1; 32],
+        sig_a: vote([1; 32]),
+        block_b: [2; 32],
+        sig_b: vote([2; 32]),
+    });
+    let before: Vec<_> = net.chain.committee();
+    let out = net.ok(vec![ev]);
+    let (_, set) = out.validator_set.expect("offender removed");
+    let expected: Vec<_> = {
+        let mut v: Vec<_> = before.into_iter().filter(|(k, _)| *k != crypto::pubkey(&bad)).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(set, expected, "the other three keep their seats and weights; no outsider gets in");
+}
+
+#[test]
+fn consensus_domain_binds_the_whole_genesis() {
+    // Same chain id and keys, any other difference: votes never transfer.
+    let base = Net::new().chain;
+    let g = |f: &dyn Fn(&mut Genesis)| {
+        let mut g = Genesis {
+            chain_id: CHAIN,
+            params: params(),
+            validators: (100..104).map(|i| crypto::pubkey(&key(i))).collect(),
+            timestamp_ms: 0,
+            launch: Default::default(),
+            staking: Default::default(),
+            bridge_program: [0; 32],
+        };
+        f(&mut g);
+        Chain::new(g).consensus_genesis()
+    };
+    assert_eq!(g(&|_| {}), base.consensus_genesis());
+    assert_ne!(g(&|g| g.bridge_program = [1; 32]), base.consensus_genesis());
+    assert_ne!(g(&|g| g.timestamp_ms = 1), base.consensus_genesis());
+    assert_ne!(g(&|g| g.validators.pop().map(|_| ()).unwrap()), base.consensus_genesis());
+    assert_ne!(g(&|g| g.staking.epoch_blocks = 10), base.consensus_genesis());
 }

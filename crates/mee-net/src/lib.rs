@@ -205,12 +205,19 @@ pub async fn start(cfg: NetConfig, p2p: TcpListener, api: TcpListener) -> std::i
     Ok(Handle { shared, p2p_addr, api_addr, tasks })
 }
 
+/// Inbound connections served at once (handshakes included).
+const MAX_INBOUND: usize = 256;
+
 async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND));
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
+        // Over the limit: drop the connection right away.
+        let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
         let s = shared.clone();
         tokio::spawn(async move {
             let _ = run_conn(s, stream).await;
+            drop(permit);
         });
     }
 }

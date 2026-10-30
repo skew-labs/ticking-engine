@@ -129,10 +129,19 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Vec<u8>> 
     Ok(body)
 }
 
+/// Reads one small handshake message (before the peer is authenticated, so
+/// it gets a tiny size limit instead of `MAX_FRAME`).
 pub async fn read_msg<R: AsyncRead + Unpin, T: BorshDeserialize>(r: &mut R) -> io::Result<T> {
-    let body = read_frame(r).await?;
+    let len = r.read_u32_le().await? as usize;
+    if len > HANDSHAKE_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "handshake frame too large"));
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
     T::try_from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
+
+const HANDSHAKE_FRAME: usize = 1_024;
 
 /// What each side signs: the peer's nonce and ephemeral key, then its own,
 /// then its own identity.

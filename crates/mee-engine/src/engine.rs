@@ -109,6 +109,14 @@ pub enum Event {
         amount: u64,
         frozen: bool,
     },
+    /// A resting order shrunk in place by `modify_order` (it keeps its
+    /// queue position).
+    Reduced {
+        market: MarketId,
+        order_id: OrderId,
+        account: AccountId,
+        remaining: u64,
+    },
     /// Auto-deleveraging: `counterparty` closed `size` against a bankrupt
     /// `target` at the bankruptcy price.
     Adl {
@@ -1050,12 +1058,15 @@ impl State {
         }
         let (dex, min_lots) = (market.dex, market.cfg.min_base_lots);
         if price == o.price && size <= o.remaining && kind != OrderKind::ImmediateOrCancel {
-            if size == 0 || (!reduce_only && size < min_lots) {
+            // The resting order's own flags aren't stored, so no exemption:
+            // a shrink never leaves an order below the minimum size.
+            if size < min_lots.max(1) {
                 return Err(Error::InvalidSize);
             }
             if size < o.remaining {
                 self.markets[m as usize].book.reduce(order_id, o.remaining - size);
                 self.release_open(a, dex, m, o.side, o.remaining - size);
+                out.push(Event::Reduced { market: m, order_id, account: a, remaining: size });
             }
             return Ok(PlaceOutcome { order_id: Some(order_id), resting: size, ..PlaceOutcome::default() });
         }
