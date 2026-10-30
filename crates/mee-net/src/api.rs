@@ -178,11 +178,14 @@ async fn account(State(s): S, Path(key): Path<String>) -> Response {
 async fn withdrawal(State(s): S, Path(id): Path<u64>) -> Response {
     // Receipt ids are sequential from 0, so the id is the index. Copy it out
     // and sign without holding the node lock.
-    let w = s.node.lock().unwrap().chain.withdrawals.get(id as usize).filter(|w| w.id == id).copied();
-    let Some(w) = w else {
+    let found = {
+        let n = s.node.lock().unwrap();
+        n.chain.withdrawals.get(id as usize).filter(|w| w.id == id).map(|w| (*w, n.chain.bridge_program))
+    };
+    let Some((w, bridge)) = found else {
         return err(StatusCode::NOT_FOUND, "no such withdrawal");
     };
-    let msg = w.message(s.chain_id);
+    let msg = w.message(s.chain_id, &bridge);
     Json(json!({
         "id": w.id,
         "asset": w.asset,

@@ -125,29 +125,47 @@ impl Bridge {
 
 // --- messages (must match mee-chain's crypto module byte for byte) -------------
 
-pub fn withdrawal_message(chain_id: u64, id: u64, asset: u8, destination: &[u8; 32], amount: u64) -> [u8; 32] {
-    hashv(&[b"MEE/withdraw", &chain_id.to_le_bytes(), &id.to_le_bytes(), &[asset], destination, &amount.to_le_bytes()])
-        .to_bytes()
+// `bridge` is this program's id: every message is bound to one deployment.
+
+pub fn withdrawal_message(
+    chain_id: u64,
+    bridge: &[u8; 32],
+    id: u64,
+    asset: u8,
+    destination: &[u8; 32],
+    amount: u64,
+) -> [u8; 32] {
+    hashv(&[
+        b"MEE/withdraw",
+        &chain_id.to_le_bytes(),
+        bridge,
+        &id.to_le_bytes(),
+        &[asset],
+        destination,
+        &amount.to_le_bytes(),
+    ])
+    .to_bytes()
 }
 
-pub fn lock_message(chain_id: u64, lock_nonce: u64) -> [u8; 32] {
-    hashv(&[b"MEE/lock", &chain_id.to_le_bytes(), &lock_nonce.to_le_bytes()]).to_bytes()
+pub fn lock_message(chain_id: u64, bridge: &[u8; 32], lock_nonce: u64) -> [u8; 32] {
+    hashv(&[b"MEE/lock", &chain_id.to_le_bytes(), bridge, &lock_nonce.to_le_bytes()]).to_bytes()
 }
 
-pub fn unlock_message(chain_id: u64, lock_nonce: u64) -> [u8; 32] {
-    hashv(&[b"MEE/unlock", &chain_id.to_le_bytes(), &lock_nonce.to_le_bytes()]).to_bytes()
+pub fn unlock_message(chain_id: u64, bridge: &[u8; 32], lock_nonce: u64) -> [u8; 32] {
+    hashv(&[b"MEE/unlock", &chain_id.to_le_bytes(), bridge, &lock_nonce.to_le_bytes()]).to_bytes()
 }
 
-pub fn cancel_message(chain_id: u64, id: u64) -> [u8; 32] {
-    hashv(&[b"MEE/cancel", &chain_id.to_le_bytes(), &id.to_le_bytes()]).to_bytes()
+pub fn cancel_message(chain_id: u64, bridge: &[u8; 32], id: u64) -> [u8; 32] {
+    hashv(&[b"MEE/cancel", &chain_id.to_le_bytes(), bridge, &id.to_le_bytes()]).to_bytes()
 }
 
-pub fn valset_message(chain_id: u64, nonce: u64, validators: &[([u8; 32], u64)]) -> [u8; 32] {
+pub fn valset_message(chain_id: u64, bridge: &[u8; 32], nonce: u64, validators: &[([u8; 32], u64)]) -> [u8; 32] {
     let weights: Vec<[u8; 8]> = validators.iter().map(|(_, w)| w.to_le_bytes()).collect();
     let mut parts: Vec<&[u8]> = vec![b"MEE/valset"];
     let c = chain_id.to_le_bytes();
     let n = nonce.to_le_bytes();
     parts.push(&c);
+    parts.push(bridge);
     parts.push(&n);
     for ((v, _), w) in validators.iter().zip(&weights) {
         parts.push(v);
@@ -187,7 +205,7 @@ pub fn withdrawal_record_pda(
     destination: &[u8; 32],
     amount: u64,
 ) -> Pubkey {
-    withdrawal_pda(program_id, &withdrawal_message(chain_id, id, asset, destination, amount)).0
+    withdrawal_pda(program_id, &withdrawal_message(chain_id, &program_id.to_bytes(), id, asset, destination, amount)).0
 }
 
 // --- Ed25519 precompile -------------------------------------------------------
@@ -465,7 +483,7 @@ fn load_withdrawal(
     if r.discriminator != WITHDRAWAL_DISCRIMINATOR || r.id != id {
         return Err(MeeError::InvalidAccountData.into());
     }
-    let msg = withdrawal_message(b.chain_id, r.id, r.asset, &r.destination, r.amount);
+    let msg = withdrawal_message(b.chain_id, &program_id.to_bytes(), r.id, r.asset, &r.destination, r.amount);
     if ai.key != &withdrawal_pda(program_id, &msg).0 {
         return Err(MeeError::InvalidPda.into());
     }
@@ -491,7 +509,7 @@ pub fn request_withdrawal(
     }
     let b = load_bridge(bridge_ai, program_id)?;
     mint_of(&b, asset)?;
-    let msg = withdrawal_message(b.chain_id, id, asset, &destination, amount);
+    let msg = withdrawal_message(b.chain_id, &program_id.to_bytes(), id, asset, &destination, amount);
     let (rp, rbump) = withdrawal_pda(program_id, &msg);
     if record.key != &rp {
         return Err(MeeError::InvalidPda.into());
@@ -542,7 +560,7 @@ pub fn approve_withdrawal(program_id: &Pubkey, it: &mut Accounts, id: u64) -> Pr
         r.approvals = 0;
         r.quorum_ts = 0;
     }
-    let msg = withdrawal_message(b.chain_id, r.id, r.asset, &r.destination, r.amount);
+    let msg = withdrawal_message(b.chain_id, &program_id.to_bytes(), r.id, r.asset, &r.destination, r.amount);
     let signers = verified_signers(instructions, &b, &msg)?;
     if signers == 0 {
         return Err(MeeError::Unauthorized.into());
@@ -605,7 +623,7 @@ pub fn lock(program_id: &Pubkey, it: &mut Accounts) -> ProgramResult {
     let bridge_ai = next(it)?;
     let instructions = next(it)?;
     let mut b = load_bridge(bridge_ai, program_id)?;
-    if verified_signers(instructions, &b, &lock_message(b.chain_id, b.lock_nonce))? == 0 {
+    if verified_signers(instructions, &b, &lock_message(b.chain_id, &program_id.to_bytes(), b.lock_nonce))? == 0 {
         return Err(MeeError::Unauthorized.into());
     }
     b.locked = 1;
@@ -617,7 +635,7 @@ pub fn unlock(program_id: &Pubkey, it: &mut Accounts) -> ProgramResult {
     let bridge_ai = next(it)?;
     let instructions = next(it)?;
     let mut b = load_bridge(bridge_ai, program_id)?;
-    if !quorum_signed(instructions, &b, &unlock_message(b.chain_id, b.lock_nonce))? {
+    if !quorum_signed(instructions, &b, &unlock_message(b.chain_id, &program_id.to_bytes(), b.lock_nonce))? {
         return Err(MeeError::Unauthorized.into());
     }
     b.locked = 0;
@@ -636,7 +654,7 @@ pub fn cancel_withdrawal(program_id: &Pubkey, it: &mut Accounts, id: u64) -> Pro
     if r.status != WITHDRAWAL_PENDING {
         return Err(MeeError::InvalidInstruction.into());
     }
-    if !quorum_signed(instructions, &b, &cancel_message(b.chain_id, id))? {
+    if !quorum_signed(instructions, &b, &cancel_message(b.chain_id, &program_id.to_bytes(), id))? {
         return Err(MeeError::Unauthorized.into());
     }
     r.status = WITHDRAWAL_CANCELLED;
@@ -647,7 +665,7 @@ pub fn rotate(program_id: &Pubkey, it: &mut Accounts, validators: &[([u8; 32], u
     let bridge_ai = next(it)?;
     let instructions = next(it)?;
     let mut b = load_bridge(bridge_ai, program_id)?;
-    let msg = valset_message(b.chain_id, b.valset_nonce, validators);
+    let msg = valset_message(b.chain_id, &program_id.to_bytes(), b.valset_nonce, validators);
     if !quorum_signed(instructions, &b, &msg)? {
         return Err(MeeError::Unauthorized.into());
     }

@@ -17,6 +17,8 @@ pub struct Genesis {
     pub timestamp_ms: i64,
     pub launch: LaunchMarkets,
     pub staking: Staking,
+    /// Solana bridge program id; part of every bridge message.
+    pub bridge_program: Pubkey,
 }
 
 /// Share of a double-signing validator's stake (and its delegators') that is
@@ -163,6 +165,7 @@ pub struct BlockOutcome {
 #[derive(Clone, Debug)]
 pub struct Chain {
     pub chain_id: u64,
+    pub bridge_program: Pubkey,
     pub validators: Vec<Pubkey>,
     pub state: State,
     pub height: u64,
@@ -217,6 +220,7 @@ impl Chain {
         state.now = g.timestamp_ms / 1_000;
         Chain {
             chain_id: g.chain_id,
+            bridge_program: g.bridge_program,
             validators: g.validators.clone(),
             state,
             height: 0,
@@ -279,7 +283,8 @@ impl Chain {
                 }
             }
             Tx::System(SystemTx::BridgeDeposit { deposit_id, owner, asset, amount, attestations }) => {
-                let msg = crypto::deposit_message(self.chain_id, *deposit_id, owner, *asset, *amount);
+                let msg =
+                    crypto::deposit_message(self.chain_id, &self.bridge_program, *deposit_id, owner, *asset, *amount);
                 self.check_quorum(&msg, attestations)
             }
             Tx::System(SystemTx::Governance { nonce, action, attestations }) => {

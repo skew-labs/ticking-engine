@@ -179,9 +179,10 @@ async fn deposit_attest_withdraw_roundtrip() {
     let mut c = chain::Chain::new(chain::Genesis {
         chain_id: CHAIN_ID,
         validators: env.validators.iter().map(crypto::pubkey).collect(),
+        bridge_program: pid.to_bytes(),
         ..Default::default()
     });
-    let msg = crypto::deposit_message(CHAIN_ID, rec.id, &rec.owner, rec.asset, rec.amount);
+    let msg = crypto::deposit_message(CHAIN_ID, &pid.to_bytes(), rec.id, &rec.owner, rec.asset, rec.amount);
     let attestations = [0usize, 1, 3]
         .iter()
         .map(|&i| chain::Attestation { validator: i as u16, signature: crypto::sign(&env.validators[i], &msg) })
@@ -205,10 +206,10 @@ async fn deposit_attest_withdraw_roundtrip() {
     let out = c.apply_block(&chain::Block { height: 1, timestamp_ms: 1_000, txs: vec![dep, w] }).unwrap();
     assert!(out.results.iter().all(|r| r.is_ok()), "{:?}", out.results);
     let r = out.withdrawals[0];
-    let rmsg = r.message(CHAIN_ID);
+    let rmsg = r.message(CHAIN_ID, &pid.to_bytes());
     assert_eq!(
         rmsg,
-        bridge::withdrawal_message(CHAIN_ID, r.id, r.asset, &r.destination, r.amount),
+        bridge::withdrawal_message(CHAIN_ID, &pid.to_bytes(), r.id, r.asset, &r.destination, r.amount),
         "chain and Solana program build the same message"
     );
 
@@ -268,7 +269,7 @@ async fn any_validator_locks_quorum_unlocks_or_cancels() {
     let payer = env.ctx.payer.pubkey();
     let dest = user.pubkey().to_bytes();
     for id in [0u64, 1] {
-        let msg = bridge::withdrawal_message(CHAIN_ID, id, ASSET_QUOTE, &dest, 1_000_000);
+        let msg = bridge::withdrawal_message(CHAIN_ID, &pid.to_bytes(), id, ASSET_QUOTE, &dest, 1_000_000);
         let mut ixs = vec![bridge::request_withdrawal_ix(&pid, &payer, CHAIN_ID, id, ASSET_QUOTE, dest, 1_000_000)];
         ixs.extend(env.approve(&msg, &env.rec(id, &dest, 1_000_000), id, &[0, 1, 2]));
         env.exec(&ixs, &[]).await.unwrap();
@@ -277,7 +278,7 @@ async fn any_validator_locks_quorum_unlocks_or_cancels() {
 
     // One validator alone halts finalization.
     let nonce = env.bridge().await.lock_nonce;
-    let lmsg = bridge::lock_message(CHAIN_ID, nonce);
+    let lmsg = bridge::lock_message(CHAIN_ID, &pid.to_bytes(), nonce);
     let lock = [bridge::ed25519_instruction(&lmsg, &env.sigs(&lmsg, &[3])), bridge::lock_ix(&pid)];
     env.exec(&lock, &[]).await.unwrap();
     assert_eq!(env.bridge().await.locked, 1);
@@ -285,7 +286,7 @@ async fn any_validator_locks_quorum_unlocks_or_cancels() {
     env.fails(&[bridge::finalize_withdrawal_ix(&pid, &mint, &user_ta, &r0, 0)], 1012).await;
 
     // A quorum cancels the suspicious withdrawal and unlocks.
-    let cmsg = bridge::cancel_message(CHAIN_ID, 1);
+    let cmsg = bridge::cancel_message(CHAIN_ID, &pid.to_bytes(), 1);
     let weak =
         [bridge::ed25519_instruction(&cmsg, &env.sigs(&cmsg, &[0, 1])), bridge::cancel_withdrawal_ix(&pid, &r1, 1)];
     env.fails(&weak, 1005).await;
@@ -293,7 +294,7 @@ async fn any_validator_locks_quorum_unlocks_or_cancels() {
         [bridge::ed25519_instruction(&cmsg, &env.sigs(&cmsg, &[0, 1, 2])), bridge::cancel_withdrawal_ix(&pid, &r1, 1)];
     env.exec(&strong, &[]).await.unwrap();
     assert_eq!(env.record(&r1).await.status, WITHDRAWAL_CANCELLED);
-    let umsg = bridge::unlock_message(CHAIN_ID, nonce);
+    let umsg = bridge::unlock_message(CHAIN_ID, &pid.to_bytes(), nonce);
     env.fails(&[bridge::ed25519_instruction(&umsg, &env.sigs(&umsg, &[3])), bridge::unlock_ix(&pid)], 1005).await;
     let unlock = [bridge::ed25519_instruction(&umsg, &env.sigs(&umsg, &[0, 1, 3])), bridge::unlock_ix(&pid)];
     env.exec(&unlock, &[]).await.unwrap();
@@ -317,12 +318,17 @@ async fn payout_only_to_the_receipt_destination() {
     let thief = Keypair::new();
     let thief_ta = env.token_account(&mint, &thief.pubkey(), 0).await;
     let dest = user.pubkey().to_bytes();
-    let msg = bridge::withdrawal_message(CHAIN_ID, 0, ASSET_QUOTE, &dest, 1_000_000);
+    let msg = bridge::withdrawal_message(CHAIN_ID, &pid.to_bytes(), 0, ASSET_QUOTE, &dest, 1_000_000);
     let payer = env.ctx.payer.pubkey();
     let r0 = env.rec(0, &dest, 1_000_000);
-    let mut ixs = vec![bridge::request_withdrawal_ix(&pid, &payer, CHAIN_ID, 0, ASSET_QUOTE, dest, 1_000_000)];
-    ixs.extend(env.approve(&msg, &r0, 0, &[0, 1, 2]));
-    env.exec(&ixs, &[]).await.unwrap();
+    env.exec(&[bridge::request_withdrawal_ix(&pid, &payer, CHAIN_ID, 0, ASSET_QUOTE, dest, 1_000_000)], &[])
+        .await
+        .unwrap();
+    // Signatures made for another deployment (same chain id and keys) count
+    // for nothing here.
+    let elsewhere = bridge::withdrawal_message(CHAIN_ID, &[9; 32], 0, ASSET_QUOTE, &dest, 1_000_000);
+    env.fails(&env.approve(&elsewhere, &r0, 0, &[0, 1, 2]), 1005).await;
+    env.exec(&env.approve(&msg, &r0, 0, &[0, 1, 2]), &[]).await.unwrap();
     env.advance(DISPUTE).await;
     env.fails(&[bridge::finalize_withdrawal_ix(&pid, &mint, &thief_ta, &r0, 0)], 1006).await;
 }
@@ -333,7 +339,7 @@ async fn rotation_needs_old_quorum_and_resets_approvals() {
     let (pid, mint) = (env.pid, env.quote_mint);
     let (user, user_ta) = env.funded_vault(1_000_000).await;
     let dest = user.pubkey().to_bytes();
-    let wmsg = bridge::withdrawal_message(CHAIN_ID, 0, ASSET_QUOTE, &dest, 1_000_000);
+    let wmsg = bridge::withdrawal_message(CHAIN_ID, &pid.to_bytes(), 0, ASSET_QUOTE, &dest, 1_000_000);
     let payer = env.ctx.payer.pubkey();
     let r0 = env.rec(0, &dest, 1_000_000);
     let mut ixs = vec![bridge::request_withdrawal_ix(&pid, &payer, CHAIN_ID, 0, ASSET_QUOTE, dest, 1_000_000)];
@@ -344,8 +350,12 @@ async fn rotation_needs_old_quorum_and_resets_approvals() {
     let new: Vec<SigningKey> = (0..7u8).map(|i| SigningKey::from_bytes(&[80 + i; 32])).collect();
     let new_keys: Vec<([u8; 32], u64)> =
         new.iter().enumerate().map(|(i, k)| (crypto::pubkey(k), if i == 0 { 10 } else { 1 })).collect();
-    let msg = bridge::valset_message(CHAIN_ID, 0, &new_keys);
-    assert_eq!(msg, crypto::valset_message(CHAIN_ID, 0, &new_keys), "chain and bridge sign the same rotation");
+    let msg = bridge::valset_message(CHAIN_ID, &pid.to_bytes(), 0, &new_keys);
+    assert_eq!(
+        msg,
+        crypto::valset_message(CHAIN_ID, &pid.to_bytes(), 0, &new_keys),
+        "chain and bridge sign the same rotation"
+    );
     let wrong: Vec<_> = new.iter().take(5).map(|k| (crypto::pubkey(k), crypto::sign(k, &msg))).collect();
     env.fails(&[bridge::ed25519_instruction(&msg, &wrong), bridge::rotate_ix(&pid, new_keys.clone())], 1005).await;
     let ok = env.sigs(&msg, &[0, 1, 2]);

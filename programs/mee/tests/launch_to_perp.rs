@@ -100,7 +100,7 @@ impl Validators {
     }
 
     fn deposit(&self, id: u64, owner: [u8; 32], amount: u64) -> Tx {
-        let msg = crypto::deposit_message(CHAIN_ID, id, &owner, chain::ASSET_QUOTE, amount);
+        let msg = crypto::deposit_message(CHAIN_ID, &mee::id().to_bytes(), id, &owner, chain::ASSET_QUOTE, amount);
         Tx::System(SystemTx::BridgeDeposit {
             deposit_id: id,
             owner,
@@ -206,6 +206,7 @@ async fn graduated_token_gets_a_perp() {
         timestamp_ms: 0,
         launch: Default::default(),
         staking: Default::default(),
+        bridge_program: mee::id().to_bytes(),
     });
     let mut height = 0;
     let mut block = |c: &mut chain::Chain, txs: Vec<Tx>| {

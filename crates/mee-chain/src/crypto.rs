@@ -34,11 +34,22 @@ pub fn quorum(n: usize) -> usize {
     n * 2 / 3 + 1
 }
 
+// Bridge messages carry the bridge program id (`bridge`) next to the chain
+// id, so signatures for one deployment never verify on another.
+
 /// What validators sign to attest a Solana bridge deposit.
-pub fn deposit_message(chain_id: u64, deposit_id: u64, owner: &Pubkey, asset: u8, amount: u64) -> Hash {
+pub fn deposit_message(
+    chain_id: u64,
+    bridge: &Pubkey,
+    deposit_id: u64,
+    owner: &Pubkey,
+    asset: u8,
+    amount: u64,
+) -> Hash {
     sha256(&[
         b"MEE/deposit",
         &chain_id.to_le_bytes(),
+        bridge,
         &deposit_id.to_le_bytes(),
         owner,
         &[asset],
@@ -48,8 +59,23 @@ pub fn deposit_message(chain_id: u64, deposit_id: u64, owner: &Pubkey, asset: u8
 
 /// What validators sign to release a withdrawal on Solana. The Solana bridge
 /// program rebuilds exactly these bytes.
-pub fn withdrawal_message(chain_id: u64, id: u64, asset: u8, destination: &Pubkey, amount: u64) -> Hash {
-    sha256(&[b"MEE/withdraw", &chain_id.to_le_bytes(), &id.to_le_bytes(), &[asset], destination, &amount.to_le_bytes()])
+pub fn withdrawal_message(
+    chain_id: u64,
+    bridge: &Pubkey,
+    id: u64,
+    asset: u8,
+    destination: &Pubkey,
+    amount: u64,
+) -> Hash {
+    sha256(&[
+        b"MEE/withdraw",
+        &chain_id.to_le_bytes(),
+        bridge,
+        &id.to_le_bytes(),
+        &[asset],
+        destination,
+        &amount.to_le_bytes(),
+    ])
 }
 
 /// What validators sign to list a graduated launchpad token as a perp.
@@ -83,12 +109,13 @@ pub fn launch_oracle_message(chain_id: u64, slot: u64, updates: &[u8]) -> Hash {
 /// What the outgoing validator set signs so the Solana bridge rotates to
 /// `validators` (key, voting weight); `nonce` is the bridge's current
 /// `valset_nonce`. Must match `mee::bridge::valset_message` byte for byte.
-pub fn valset_message(chain_id: u64, nonce: u64, validators: &[(Pubkey, u64)]) -> Hash {
+pub fn valset_message(chain_id: u64, bridge: &Pubkey, nonce: u64, validators: &[(Pubkey, u64)]) -> Hash {
     let weights: Vec<[u8; 8]> = validators.iter().map(|(_, w)| w.to_le_bytes()).collect();
     let mut parts: Vec<&[u8]> = vec![b"MEE/valset"];
     let c = chain_id.to_le_bytes();
     let n = nonce.to_le_bytes();
     parts.push(&c);
+    parts.push(bridge);
     parts.push(&n);
     for ((v, _), w) in validators.iter().zip(&weights) {
         parts.push(v);

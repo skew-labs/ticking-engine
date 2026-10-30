@@ -48,6 +48,7 @@ impl Net {
             timestamp_ms: 0,
             launch: Default::default(),
             staking: Default::default(),
+            bridge_program: [0; 32],
         });
         Net { chain, validators, nonces: Default::default(), deposits: 0, ts: 0 }
     }
@@ -68,7 +69,7 @@ impl Net {
         let id = self.deposits;
         self.deposits += 1;
         let owner = crypto::pubkey(owner);
-        let msg = crypto::deposit_message(CHAIN, id, &owner, asset, amount);
+        let msg = crypto::deposit_message(CHAIN, &[0; 32], id, &owner, asset, amount);
         Tx::System(SystemTx::BridgeDeposit {
             deposit_id: id,
             owner,
@@ -168,11 +169,11 @@ fn signatures_and_nonces() {
 fn deposits_need_ordered_quorum_attestations() {
     let mut net = Net::new();
     let owner = crypto::pubkey(&key(1));
-    let msg = crypto::deposit_message(CHAIN, 0, &owner, ASSET_QUOTE, 100);
+    let msg = crypto::deposit_message(CHAIN, &[0; 32], 0, &owner, ASSET_QUOTE, 100);
     let two = net.attest(&msg, &[0, 1]);
     let dup = net.attest(&msg, &[0, 0, 1]);
     let wrong = {
-        let m = crypto::deposit_message(CHAIN, 0, &owner, ASSET_QUOTE, 1_000_000);
+        let m = crypto::deposit_message(CHAIN, &[0; 32], 0, &owner, ASSET_QUOTE, 1_000_000);
         net.attest(&m, &[0, 1, 2])
     };
     let d = |id, att| {
@@ -187,7 +188,7 @@ fn deposits_need_ordered_quorum_attestations() {
     let out = net.block(vec![d(0, two), d(0, dup), d(0, wrong)]);
     assert_eq!(out.results, vec![Err(TxError::NoQuorum); 3]);
     let skip = {
-        let m = crypto::deposit_message(CHAIN, 1, &owner, ASSET_QUOTE, 100);
+        let m = crypto::deposit_message(CHAIN, &[0; 32], 1, &owner, ASSET_QUOTE, 100);
         net.attest(&m, &[1, 2, 3])
     };
     let out = net.block(vec![d(1, skip)]);
@@ -217,9 +218,13 @@ fn trading_and_withdrawal_receipts() {
     let r = out.withdrawals[0];
     assert_eq!(r, WithdrawalReceipt { id: 0, asset: ASSET_QUOTE, destination: dest, amount: 400_000 });
     // Validators sign the receipt; the Solana bridge checks the quorum.
-    let sigs: Vec<_> =
-        net.validators.iter().take(3).map(|v| (crypto::pubkey(v), crypto::sign(v, &r.message(CHAIN)))).collect();
-    assert!(sigs.iter().all(|(pk, s)| crypto::verify(pk, &r.message(CHAIN), s)));
+    let sigs: Vec<_> = net
+        .validators
+        .iter()
+        .take(3)
+        .map(|v| (crypto::pubkey(v), crypto::sign(v, &r.message(CHAIN, &[0; 32]))))
+        .collect();
+    assert!(sigs.iter().all(|(pk, s)| crypto::verify(pk, &r.message(CHAIN, &[0; 32]), s)));
 
     let txs = vec![net.tx(&a, Action::Withdraw { asset: ASSET_QUOTE, amount: 10_000_000, destination: dest })];
     let out = net.block(txs);
@@ -362,6 +367,7 @@ fn staking_elects_the_validator_set_each_epoch() {
         timestamp_ms: 0,
         launch: Default::default(),
         staking: Staking { epoch_blocks: 2, max_validators: 4, min_validator_stake: 10, unbond_secs: 100 },
+        bridge_program: [0; 32],
     });
     let delegator = key(7);
     let newcomer_key = key(200);
@@ -387,8 +393,8 @@ fn staking_elects_the_validator_set_each_epoch() {
     assert_eq!(net.chain.validators, keys);
     assert_eq!(net.chain.total_weight(), 530);
     // The bridge rotation message the outgoing set signs.
-    let msg = crypto::valset_message(CHAIN, 0, &set);
-    assert_ne!(msg, crypto::valset_message(CHAIN, 0, &[(newcomer, 499)]));
+    let msg = crypto::valset_message(CHAIN, &[0; 32], 0, &set);
+    assert_ne!(msg, crypto::valset_message(CHAIN, &[0; 32], 0, &[(newcomer, 499)]));
 
     // Over-undelegating fails; a real undelegation stops counting at the
     // next election but stays locked until that election has passed.

@@ -451,5 +451,6 @@ pub fn devnet_genesis(chain_id: u64, validators: u32) -> Genesis {
         timestamp_ms: 0,
         launch: Default::default(),
         staking: Default::default(),
+        bridge_program: [0; 32],
     }
 }

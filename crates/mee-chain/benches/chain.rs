@@ -35,6 +35,7 @@ fn main() {
         timestamp_ms: 0,
         launch: Default::default(),
         staking: Default::default(),
+        bridge_program: [0; 32],
     });
     let traders: Vec<SigningKey> = (0..2_000u32)
         .map(|i| {
@@ -55,7 +56,7 @@ fn main() {
     for (i, k) in std::iter::once(&dep).chain(&traders).enumerate() {
         let owner = crypto::pubkey(k);
         let (asset, amount) = if i == 0 { (ASSET_STAKE, 1) } else { (ASSET_QUOTE, 1_000_000_000_000) };
-        let msg = crypto::deposit_message(CHAIN, i as u64, &owner, asset, amount);
+        let msg = crypto::deposit_message(CHAIN, &[0; 32], i as u64, &owner, asset, amount);
         let attestations = (0..3)
             .map(|v| Attestation { validator: v as u16, signature: crypto::sign(&validators[v], &msg) })
             .collect();

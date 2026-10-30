@@ -64,6 +64,7 @@ impl Devnet {
             timestamp_ms: 0,
             launch: Default::default(),
             staking,
+            bridge_program: [0; 32],
         };
         let cfg = Config { base_timeout_ms: 200, max_timeout_ms: 2_000 };
         let mut starts = Vec::new();
@@ -184,7 +185,7 @@ impl Devnet {
         let id = self.deposits;
         self.deposits += 1;
         let owner = crypto::pubkey(owner);
-        let msg = crypto::deposit_message(CHAIN, id, &owner, asset, amount);
+        let msg = crypto::deposit_message(CHAIN, &[0; 32], id, &owner, asset, amount);
         let set = self.live().next().unwrap().chain.validators.clone();
         let attestations: Vec<Attestation> = set
             .iter()

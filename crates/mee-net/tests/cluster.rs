@@ -64,7 +64,7 @@ async fn launch(i: u32, validators: u32, p2p: TcpListener, peers: Vec<SocketAddr
 
 fn deposit(id: u64, owner: &SigningKey, asset: u8, amount: u64) -> Tx {
     let owner = crypto::pubkey(owner);
-    let msg = crypto::deposit_message(CHAIN, id, &owner, asset, amount);
+    let msg = crypto::deposit_message(CHAIN, &[0; 32], id, &owner, asset, amount);
     let attestations =
         (0..4).map(|v| Attestation { validator: v, signature: crypto::sign(&devnet_key(v as u32), &msg) }).collect();
     Tx::System(SystemTx::BridgeDeposit { deposit_id: id, owner, asset, amount, attestations })

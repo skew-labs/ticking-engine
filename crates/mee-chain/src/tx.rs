@@ -273,7 +273,8 @@ pub struct WithdrawalReceipt {
 }
 
 impl WithdrawalReceipt {
-    pub fn message(&self, chain_id: u64) -> Hash {
-        crypto::withdrawal_message(chain_id, self.id, self.asset, &self.destination, self.amount)
+    /// `bridge` = the Solana bridge program id.
+    pub fn message(&self, chain_id: u64, bridge: &Pubkey) -> Hash {
+        crypto::withdrawal_message(chain_id, bridge, self.id, self.asset, &self.destination, self.amount)
     }
 }
